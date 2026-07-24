@@ -358,6 +358,7 @@ async function fetchOmdb(imdbId){
   }
   const countries = (data.Country && data.Country !== 'N/A') ? data.Country.split(',').map(c=>c.trim()) : [];
   const languages = (data.Language && data.Language !== 'N/A') ? data.Language.split(',').map(l=>l.trim()) : [];
+  const primaryLanguage = languages[0] || '';
   const production = (data.Production && data.Production !== 'N/A') ? data.Production : '';
   return {
     imdbId,
@@ -370,7 +371,7 @@ async function fetchOmdb(imdbId){
     writer: (data.Writer && data.Writer !== 'N/A') ? data.Writer : '',
     actors: (data.Actors && data.Actors !== 'N/A') ? data.Actors : '',
     genres: (data.Genre && data.Genre !== 'N/A') ? data.Genre.split(',').map(g=>translateGenre(g.trim())) : [],
-    countries, languages, production,
+    countries, languages, primaryLanguage, production,
     runtimeMin,
     releaseDate,
     ratings: { imdb: imdbRating, rtCritics: rtCritics, metacritic: metascore }
@@ -444,7 +445,7 @@ async function fetchAllSources(imdbId){
     synopsisAuto,
     director: omdb.director, writer: omdb.writer, actors: omdb.actors,
     genres: omdb.genres, runtimeMin: omdb.runtimeMin, releaseDate: omdb.releaseDate,
-    countries: omdb.countries, languages: omdb.languages, production: omdb.production,
+    countries: omdb.countries, languages: omdb.languages, primaryLanguage: omdb.primaryLanguage, production: omdb.production,
     ratings: omdb.ratings
   };
 }
@@ -481,7 +482,7 @@ function allContinents(){
 }
 function allLanguages(){
   const set = new Set();
-  state.movies.forEach(m => (m.languages||[]).forEach(l=>set.add(l)));
+  state.movies.forEach(m => { const l = m.primaryLanguage || (m.languages||[])[0]; if(l) set.add(l); });
   return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
 }
 function allDecades(){
@@ -556,7 +557,7 @@ function getFilteredSorted(){
     list = list.filter(m => (m.countries||[]).some(c => countryToContinent(c) === f.continent));
   }
   if(f.language !== 'all'){
-    list = list.filter(m => (m.languages||[]).includes(f.language));
+    list = list.filter(m => (m.primaryLanguage || (m.languages||[])[0]) === f.language);
   }
   if(f.genres.length){
     list = list.filter(m => (m.genres||[]).some(g => f.genres.includes(g)));
@@ -617,6 +618,17 @@ function sortMovieList(list, field, dir){
     return 0;
   });
   return out;
+}
+
+function catalogListHtml(list){
+  if(list.length===0){
+    return `
+      <div class="empty">
+        <div class="display">Nenhum filme por aqui ainda</div>
+        <p>Toque no botão dourado para colar o link de um filme do IMDb e começar o catálogo da família.</p>
+      </div>`;
+  }
+  return list.map(renderCard).join('');
 }
 
 /* ---------- RENDER ---------- */
@@ -724,7 +736,7 @@ function renderMain(){
       <select id="sort-field" onchange="__setSort(this.value)">
         ${sortOptions().map(o=>`<option value="${o.v}" ${state.sortField===o.v?'selected':''}>${o.l}</option>`).join('')}
       </select>
-      <div class="radio-row">
+      <div class="radio-row" style="margin-top:14px">
         <div class="chip ${state.sortDir==='desc'?'active':''}" onclick="__setDir('desc')">↓ Maior/mais recente primeiro</div>
         <div class="chip ${state.sortDir==='asc'?'active':''}" onclick="__setDir('asc')">↑ Menor/mais antigo primeiro</div>
       </div>
@@ -806,18 +818,17 @@ function renderMain(){
     </div>
 
     <div id="catalog">
-      ${list.length===0 ? `
-        <div class="empty">
-          <div class="display">Nenhum filme por aqui ainda</div>
-          <p>Toque no botão dourado para colar o link de um filme do IMDb e começar o catálogo da família.</p>
-        </div>
-      ` : list.map(renderCard).join('')}
+      ${catalogListHtml(list)}
     </div>
   </div>
   <button class="fab" onclick="__openAdd()">+</button>
   `;
 
-  window.__setSearch = (v)=>{ state.search=v; render(); };
+  window.__setSearch = (v)=>{
+    state.search = v;
+    const el = document.getElementById('catalog');
+    if(el) el.innerHTML = catalogListHtml(getFilteredSorted());
+  };
   window.__setSort = (v)=>{ state.sortField=v; render(); };
   window.__setDir = (v)=>{ state.sortDir=v; render(); };
   window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; render(); };
@@ -997,9 +1008,9 @@ function renderAddModal(){
       year: d.year, poster: d.poster,
       synopsisPt: d.synopsisPt, synopsisAuto: d.synopsisAuto,
       director: d.director, writer: d.writer, actors: d.actors, genres: d.genres,
-      countries: d.countries||[], languages: d.languages||[], production: d.production||'',
+      countries: d.countries||[], languages: d.languages||[], primaryLanguage: d.primaryLanguage||'', production: d.production||'',
       runtimeMin: d.runtimeMin, releaseDate: d.releaseDate, ratings: d.ratings,
-      addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: []
+      addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: [], dismissedBy: []
     };
     state.family.members.forEach(m => movie.votes[m] = {liked:null, score:null});
     movie.checkins = {};
@@ -1372,20 +1383,23 @@ function renderWatchlistModal(){
 }
 
 /* ---------- RECOMENDAÇÕES ---------- */
+function runtimeBucket(min){
+  if(min==null) return null;
+  if(min<90) return 'curto (<90min)';
+  if(min<=120) return 'médio (90-120min)';
+  if(min<=150) return 'longo (120-150min)';
+  return 'muito longo (150min+)';
+}
+
 function buildTasteProfile(person, excludeId){
-  const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{} };
+  const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{}, runtime:{} };
   let count = 0;
   function bump(map, key, w){
     if(!map[key]) map[key] = { sum:0, n:0 };
     map[key].sum += w;
     map[key].n += 1;
   }
-  state.movies.forEach(m=>{
-    if(m.id === excludeId) return;
-    const v = m.votes[person];
-    if(!v || v.score==null) return;
-    count++;
-    const w = v.score - 5.5;
+  function applyMovie(m, w){
     const decade = m.year ? Math.floor(parseInt(m.year)/10)*10 : null;
     (m.genres||[]).forEach(g=>{
       bump(maps.genre, g, w);
@@ -1398,6 +1412,19 @@ function buildTasteProfile(person, excludeId){
     (m.countries||[]).forEach(c=>bump(maps.country, c, w));
     if(decade!=null) bump(maps.decade, decade, w);
     if(m.production) bump(maps.studio, m.production, w);
+    const rb = runtimeBucket(m.runtimeMin);
+    if(rb) bump(maps.runtime, rb, w);
+  }
+  state.movies.forEach(m=>{
+    if(m.id === excludeId) return;
+    const v = m.votes[person];
+    if(v && v.score!=null){
+      count++;
+      applyMovie(m, v.score - 5.5);
+    } else if(m.dismissedBy && m.dismissedBy.includes(person)){
+      // "Não me interessa" conta como um sinal negativo claro, mesmo sem nota formal
+      applyMovie(m, -2.5);
+    }
   });
   return { maps, count };
 }
@@ -1416,6 +1443,51 @@ function crossUserAffinity(personA, personB){
   const raw = (sum/common.length)*2 - 1; // -1..1
   const confidence = Math.min(1, common.length/8); // precisa de ~8 filmes em comum pra confiança máxima
   return raw * confidence;
+}
+
+// Afinidade entre duas pessoas, mas específica pro contexto do filme (gênero, década, país) —
+// já que duas pessoas podem concordar em comédia e discordar em terror, por exemplo.
+function segmentAffinity(personA, personB, filterFn){
+  const common = state.movies.filter(m=>{
+    const a=m.votes[personA], b=m.votes[personB];
+    return a && a.score!=null && b && b.score!=null && filterFn(m);
+  });
+  if(common.length < 2) return null;
+  let sum=0;
+  common.forEach(m=>{
+    const diff = Math.abs(m.votes[personA].score - m.votes[personB].score);
+    sum += (1 - diff/9);
+  });
+  const raw = (sum/common.length)*2 - 1;
+  const confidence = Math.min(1, common.length/5);
+  return { value: raw*confidence, n: common.length };
+}
+
+function crossUserAffinityFor(personA, personB, movie){
+  const overall = crossUserAffinity(personA, personB);
+  const decade = movie.year ? Math.floor(parseInt(movie.year)/10)*10 : null;
+  const segments = [];
+  (movie.genres||[]).forEach(g=>{
+    const s = segmentAffinity(personA, personB, m=>(m.genres||[]).includes(g));
+    if(s) segments.push(s);
+  });
+  if(decade!=null){
+    const s = segmentAffinity(personA, personB, m=>{ const y=parseInt(m.year); return !isNaN(y) && Math.floor(y/10)*10===decade; });
+    if(s) segments.push(s);
+  }
+  (movie.countries||[]).forEach(c=>{
+    const s = segmentAffinity(personA, personB, m=>(m.countries||[]).includes(c));
+    if(s) segments.push(s);
+  });
+  // combina: afinidade geral como "base" (peso 1) + cada afinidade específica pesada pelo quanto de dado ela tem
+  let weightedSum = overall * 1;
+  let totalWeight = 1;
+  segments.forEach(s=>{
+    const w = Math.min(3, s.n/2);
+    weightedSum += s.value * w;
+    totalWeight += w;
+  });
+  return weightedSum / totalWeight;
 }
 
 // Peso mínimo de avaliações para uma "chave" (gênero/ator/etc) começar a contar com força.
@@ -1451,6 +1523,8 @@ function rawTasteSignal(movie, maps){
   (movie.countries||[]).forEach(c=>{
     add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1);
   });
+  const rb = runtimeBucket(movie.runtimeMin);
+  if(rb) add(maps.runtime, [rb], 0.6);
   return { raw, maxPossible };
 }
 
@@ -1493,6 +1567,33 @@ function backtestAccuracy(person){
   return result;
 }
 
+let _alignCache = {};
+function aggregatorAlignment(person){
+  const rated = state.movies.filter(m=>m.votes[person] && m.votes[person].score!=null);
+  const cacheKey = person+':'+rated.length;
+  if(_alignCache[cacheKey]) return _alignCache[cacheKey];
+  function corrWith(getter){
+    const xs=[], ys=[];
+    rated.forEach(m=>{
+      const ext = getter(m);
+      if(ext==null) return;
+      xs.push(m.votes[person].score);
+      ys.push(ext);
+    });
+    if(xs.length<4) return 0;
+    return pearson(xs,ys);
+  }
+  const result = {
+    imdbCorr: corrWith(m=>m.ratings.imdb),
+    criticCorr: corrWith(m=>{
+      const vals=[m.ratings.rtCritics, m.ratings.metacritic].filter(v=>v!=null);
+      return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
+    })
+  };
+  _alignCache[cacheKey] = result;
+  return result;
+}
+
 function estimateAffinity(movie, person){
   const { maps, count } = buildTasteProfile(person, movie.id);
   if(count < 6) return { ready:false, pct:50 };
@@ -1500,11 +1601,22 @@ function estimateAffinity(movie, person){
   const { raw:tasteRaw, maxPossible:tasteMax } = rawTasteSignal(movie, maps);
   let raw = tasteRaw, maxPossible = tasteMax;
 
-  // Camada de segurança: consenso de crítica externa (evita "gênero combina" mas o filme é objetivamente ruim)
-  const criticScores = [movie.ratings.imdb, movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
-  if(criticScores.length){
-    const avgCritic = criticScores.reduce((a,b)=>a+b,0)/criticScores.length;
-    raw += (avgCritic-5.5) * 0.6;
+  // Camada de segurança: consenso de crítica externa, mas pesado por qual agregador mais "bate" com você
+  // (algumas pessoas concordam mais com o público do IMDb, outras com a crítica do Metacritic/RT)
+  const align = aggregatorAlignment(person);
+  const criticVals = [movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
+  const criticAvg = criticVals.length ? criticVals.reduce((a,b)=>a+b,0)/criticVals.length : null;
+  const imdbVal = movie.ratings.imdb;
+  let extScore = null;
+  if(imdbVal!=null && criticAvg!=null){
+    let wImdb = Math.abs(align.imdbCorr), wCritic = Math.abs(align.criticCorr);
+    if(wImdb+wCritic < 0.2){ wImdb = 0.5; wCritic = 0.5; } // sem sinal claro: pesa igual
+    else { const t=wImdb+wCritic; wImdb/=t; wCritic/=t; }
+    extScore = imdbVal*wImdb + criticAvg*wCritic;
+  } else if(imdbVal!=null){ extScore = imdbVal; }
+  else if(criticAvg!=null){ extScore = criticAvg; }
+  if(extScore!=null){
+    raw += (extScore-5.5) * 0.6;
     maxPossible += 5*0.6;
   }
 
@@ -1512,7 +1624,7 @@ function estimateAffinity(movie, person){
     if(other===person) return;
     const v = movie.votes[other];
     if(!v || v.score==null) return;
-    const affinity = crossUserAffinity(person, other);
+    const affinity = crossUserAffinityFor(person, other, movie);
     if(affinity===0) return;
     const contribution = (v.score-5.5) * affinity * 0.9;
     raw += contribution;
@@ -1532,10 +1644,46 @@ function estimateAffinity(movie, person){
 function computeRecommendations(){
   const myRatedCount = state.movies.filter(m=>m.votes[state.me] && m.votes[state.me].score!=null).length;
   if(myRatedCount < 6) return { ready:false, items:[] };
-  const candidates = state.movies.filter(m => !(m.votes[state.me] && m.votes[state.me].score!=null) && !(m.hiddenBy && m.hiddenBy.includes(state.me)));
+  const candidates = state.movies.filter(m =>
+    !(m.votes[state.me] && m.votes[state.me].score!=null) &&
+    !(m.hiddenBy && m.hiddenBy.includes(state.me)) &&
+    !(m.dismissedBy && m.dismissedBy.includes(state.me))
+  );
   const scored = candidates.map(m=>({ m, pct: estimateAffinity(m, state.me).pct }));
   scored.sort((a,b)=>b.pct - a.pct);
   return { ready:true, items: scored.slice(0,15) };
+}
+
+function explainRecommendation(movie, person){
+  const { maps } = buildTasteProfile(person, movie.id);
+  const reasons = [];
+  function topReason(map, keys, prefix){
+    let best=null;
+    keys.forEach(k=>{
+      const entry = map[k];
+      if(!entry || entry.n<2) return;
+      const w = shrunkWeight(entry);
+      if(w>1.4 && (!best || w>best.w)) best = {k, w};
+    });
+    if(best) reasons.push(`${prefix} ${best.k}`);
+  }
+  topReason(maps.genre, movie.genres||[], 'Você costuma gostar de');
+  if(movie.director) topReason(maps.director, movie.director.split(',').map(s=>s.trim()), 'Você gosta dos trabalhos de');
+  if(movie.actors) topReason(maps.actor, movie.actors.split(',').map(s=>s.trim()), 'Você gosta de filmes com');
+  state.family.members.forEach(other=>{
+    if(other===person || reasons.length>=4) return;
+    const v = movie.votes[other];
+    if(v && v.score!=null && v.score>=8){
+      const aff = crossUserAffinityFor(person, other, movie);
+      if(aff>0.35) reasons.push(`${other} deu nota ${v.score} e o gosto de vocês combina bastante nesse tipo de filme`);
+    }
+  });
+  const criticVals = [movie.ratings.imdb, movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
+  if(criticVals.length && reasons.length<4){
+    const avg = criticVals.reduce((a,b)=>a+b,0)/criticVals.length;
+    if(avg>=7.5) reasons.push(`Bem avaliado pela crítica/público em geral (${avg.toFixed(1)}/10)`);
+  }
+  return reasons.slice(0,4);
 }
 
 function renderRecommendationsModal(){
@@ -1555,22 +1703,36 @@ function renderRecommendationsModal(){
         </p>
       ` : `
         <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus votos, na crítica especializada e em quão parecido seu gosto é com o dos outros — não é garantia, é uma sugestão.</p>
-        ${items.map(({m,pct})=>`
-          <div class="ticket" onclick="__closeRecommendations(); __openMovie('${m.id}')" style="margin:10px 0">
-            ${m.poster?`<img class="poster" src="${m.poster}">`:`<div class="poster-ph">🎬</div>`}
+        ${items.map(({m,pct})=>{
+          const reasons = explainRecommendation(m, state.me);
+          return `
+          <div class="ticket" style="margin:10px 0">
+            <div style="display:contents" onclick="__closeRecommendations(); __openMovie('${m.id}')">
+              ${m.poster?`<img class="poster" src="${m.poster}">`:`<div class="poster-ph">🎬</div>`}
+            </div>
             <div class="ticket-body">
-              <h4>${escapeHtml(displayTitle(m))}</h4>
+              <h4 onclick="__closeRecommendations(); __openMovie('${m.id}')">${escapeHtml(displayTitle(m))}</h4>
               <div class="ticket-meta">${(m.genres||[]).slice(0,3).join(', ')}</div>
               <div style="margin-top:6px;font-size:22px;font-family:'Bebas Neue';color:var(--gold)">${pct}% de afinidade</div>
+              ${reasons.length ? `<ul style="margin:6px 0 0;padding-left:16px;font-size:12px;color:var(--muted)">${reasons.map(r=>`<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
+              <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="__dismissRecommendation('${m.id}')">🚫 Não me interessa</button>
             </div>
-          </div>
-        `).join('')}
+          </div>`;
+        }).join('')}
         ${items.length===0 ? `<p class="hint">Nenhum filme novo no catálogo pra recomendar ainda — adicione mais títulos.</p>` : ''}
       `}
     </div>
   </div>`);
   document.getElementById('reco-overlay').addEventListener('click',(e)=>{ if(e.target.id==='reco-overlay') __closeRecommendations(); });
   window.__closeRecommendations = ()=>{ state.recommendationsOpen=false; render(); };
+  window.__dismissRecommendation = async (movieId)=>{
+    const movie = state.movies.find(x=>x.id===movieId);
+    if(!movie) return;
+    if(!movie.dismissedBy) movie.dismissedBy = [];
+    if(!movie.dismissedBy.includes(state.me)) movie.dismissedBy.push(state.me);
+    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    render(); state.recommendationsOpen = true; render();
+  };
 }
 
 /* ---------- IMPORTAÇÃO EM MASSA DO IMDB ---------- */
@@ -1730,9 +1892,9 @@ async function __runImportQueue(){
             type: data.type || 'movie', year: data.year, poster: data.poster,
             synopsisPt: data.synopsisPt, synopsisAuto: data.synopsisAuto,
             director: data.director, writer: data.writer, actors: data.actors, genres: data.genres,
-            countries: data.countries||[], languages: data.languages||[], production: data.production||'',
+            countries: data.countries||[], languages: data.languages||[], primaryLanguage: data.primaryLanguage||'', production: data.production||'',
             runtimeMin: data.runtimeMin, releaseDate: data.releaseDate, ratings: data.ratings,
-            addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: []
+            addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: [], dismissedBy: []
           };
           state.family.members.forEach(m => movie.votes[m] = {liked:null, score:null});
           movie.votes[state.me] = { liked: null, score: entry.rating };
