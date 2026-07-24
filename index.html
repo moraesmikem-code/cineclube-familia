@@ -876,7 +876,7 @@ function renderCard(m){
         ${ratingChip('IMDb', m.ratings.imdb)}
         ${ratingChip('RT', m.ratings.rtCritics)}
         ${ratingChip('Metacritic', m.ratings.metacritic)}
-        ${(()=>{ const r=estimateAffinity(m,state.me); return r.ready ? `<span>Recomendação: <b style="color:var(--gold)">${r.pct}%</b></span>` : ''; })()}
+        ${(()=>{ const myV=m.votes[state.me]; if(myV && myV.score!=null) return ''; const r=estimateAffinity(m,state.me); return r.ready ? `<span>Recomendação: <b style="color:var(--gold)">${r.pct}%</b></span>` : ''; })()}
       </div>
       ${checkinHtml}
       <div class="perf"></div>
@@ -1040,7 +1040,12 @@ function renderMovieModal(id){
         ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings.metacritic)}
         <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar nota do RT</button>
       </div>
-      ${(()=>{ const r=estimateAffinity(m,state.me); return r.ready ? `<div style="margin:6px 0 10px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>` : `<div class="hint" style="margin:6px 0 10px">Avalie mais filmes pra eu conseguir estimar uma recomendação pra este título.</div>`; })()}
+      ${(()=>{
+        const myV = m.votes[state.me];
+        if(myV && myV.score!=null) return `<div class="hint" style="margin:6px 0 10px">Você já avaliou este título (nota ${myV.score}/10) — recomendação só aparece pra filmes ainda não avaliados por você.</div>`;
+        const r=estimateAffinity(m,state.me);
+        return r.ready ? `<div style="margin:6px 0 10px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>` : `<div class="hint" style="margin:6px 0 10px">Avalie pelo menos 6 filmes pra eu conseguir estimar uma recomendação com confiança.</div>`;
+      })()}
       ${state._editingRatings===m.id ? `
       <div class="vote-editor">
         <h4>Editar nota do Rotten Tomatoes</h4>
@@ -1370,6 +1375,11 @@ function renderWatchlistModal(){
 function buildTasteProfile(person, excludeId){
   const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{} };
   let count = 0;
+  function bump(map, key, w){
+    if(!map[key]) map[key] = { sum:0, n:0 };
+    map[key].sum += w;
+    map[key].n += 1;
+  }
   state.movies.forEach(m=>{
     if(m.id === excludeId) return;
     const v = m.votes[person];
@@ -1378,16 +1388,16 @@ function buildTasteProfile(person, excludeId){
     const w = v.score - 5.5;
     const decade = m.year ? Math.floor(parseInt(m.year)/10)*10 : null;
     (m.genres||[]).forEach(g=>{
-      maps.genre[g] = (maps.genre[g]||0)+w;
-      if(decade!=null){ const k=g+'|'+decade; maps.genreDecade[k]=(maps.genreDecade[k]||0)+w; }
-      (m.countries||[]).forEach(c=>{ const k2=g+'|'+c; maps.genreCountry[k2]=(maps.genreCountry[k2]||0)+w; });
+      bump(maps.genre, g, w);
+      if(decade!=null) bump(maps.genreDecade, g+'|'+decade, w);
+      (m.countries||[]).forEach(c=>bump(maps.genreCountry, g+'|'+c, w));
     });
-    if(m.director) m.director.split(',').map(s=>s.trim()).forEach(d=>{ maps.director[d]=(maps.director[d]||0)+w; });
-    if(m.writer) m.writer.split(',').map(s=>s.trim()).forEach(wr=>{ maps.writer[wr]=(maps.writer[wr]||0)+w; });
-    if(m.actors) m.actors.split(',').map(s=>s.trim()).forEach(a=>{ maps.actor[a]=(maps.actor[a]||0)+w; });
-    (m.countries||[]).forEach(c=>{ maps.country[c]=(maps.country[c]||0)+w; });
-    if(decade!=null) maps.decade[decade]=(maps.decade[decade]||0)+w;
-    if(m.production) maps.studio[m.production] = (maps.studio[m.production]||0)+w;
+    if(m.director) m.director.split(',').map(s=>s.trim()).forEach(d=>bump(maps.director, d, w));
+    if(m.writer) m.writer.split(',').map(s=>s.trim()).forEach(wr=>bump(maps.writer, wr, w));
+    if(m.actors) m.actors.split(',').map(s=>s.trim()).forEach(a=>bump(maps.actor, a, w));
+    (m.countries||[]).forEach(c=>bump(maps.country, c, w));
+    if(decade!=null) bump(maps.decade, decade, w);
+    if(m.production) bump(maps.studio, m.production, w);
   });
   return { maps, count };
 }
@@ -1397,24 +1407,36 @@ function crossUserAffinity(personA, personB){
     const a=m.votes[personA], b=m.votes[personB];
     return a && a.score!=null && b && b.score!=null;
   });
-  if(common.length < 2) return 0;
+  if(common.length < 3) return 0; // exige mais filmes em comum antes de confiar na afinidade
   let sum=0;
   common.forEach(m=>{
     const diff = Math.abs(m.votes[personA].score - m.votes[personB].score);
     sum += (1 - diff/9);
   });
-  return (sum/common.length)*2 - 1; // -1..1
+  const raw = (sum/common.length)*2 - 1; // -1..1
+  const confidence = Math.min(1, common.length/8); // precisa de ~8 filmes em comum pra confiança máxima
+  return raw * confidence;
 }
 
-function estimateAffinity(movie, person){
-  const { maps, count } = buildTasteProfile(person, movie.id);
-  if(count < 3) return { ready:false, pct:50 };
+// Peso mínimo de avaliações para uma "chave" (gênero/ator/etc) começar a contar com força.
+// Um único filme não deve empurrar a % pra cima ou pra baixo sozinho.
+const SHRINK_K = 3;
+function shrunkWeight(entry){
+  if(!entry || entry.n===0) return 0;
+  const avg = entry.sum / entry.n;
+  const confidence = entry.n / (entry.n + SHRINK_K);
+  return avg * confidence;
+}
+
+// Sinal "cru" — só os padrões de gosto (gêneros, pessoas, país, década, produtora, interações).
+// Usado tanto pra prever quanto pra o backtest de auto-validação.
+function rawTasteSignal(movie, maps){
   let raw = 0, maxPossible = 0.0001;
   function add(map, keys, weightMul){
     keys.forEach(k=>{
-      const s = map[k]||0;
-      raw += s*weightMul;
-      maxPossible += (Math.abs(s)+1)*weightMul;
+      const eff = shrunkWeight(map[k]);
+      raw += eff*weightMul;
+      maxPossible += (Math.abs(eff)+1)*weightMul;
     });
   }
   const decade = movie.year ? Math.floor(parseInt(movie.year)/10)*10 : null;
@@ -1429,7 +1451,62 @@ function estimateAffinity(movie, person){
   (movie.countries||[]).forEach(c=>{
     add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1);
   });
-  if(movie.ratings.imdb!=null){ raw += (movie.ratings.imdb-5.5)*0.3; maxPossible += 5*0.3; }
+  return { raw, maxPossible };
+}
+
+function pearson(xs, ys){
+  const n = xs.length;
+  if(n < 2) return 0;
+  const mx = xs.reduce((a,b)=>a+b,0)/n;
+  const my = ys.reduce((a,b)=>a+b,0)/n;
+  let num=0, dx2=0, dy2=0;
+  for(let i=0;i<n;i++){
+    const dx=xs[i]-mx, dy=ys[i]-my;
+    num += dx*dy; dx2 += dx*dx; dy2 += dy*dy;
+  }
+  if(dx2===0||dy2===0) return 0;
+  return num/Math.sqrt(dx2*dy2);
+}
+
+// Auto-validação: esconde cada filme já avaliado, um de cada vez, prevê com o resto,
+// e compara com a nota real dada — pra saber se o modelo é realmente confiável pra essa pessoa.
+let _backtestCache = {};
+function backtestAccuracy(person){
+  const rated = state.movies.filter(m=>m.votes[person] && m.votes[person].score!=null);
+  const cacheKey = person+':'+rated.length;
+  if(_backtestCache[cacheKey]) return _backtestCache[cacheKey];
+  if(rated.length < 8){
+    const result = { corr: 0.35, n: rated.length }; // poucos dados: confiança moderada, não extrema
+    _backtestCache[cacheKey] = result;
+    return result;
+  }
+  const preds = [], actuals = [];
+  rated.forEach(m=>{
+    const { maps, count } = buildTasteProfile(person, m.id);
+    if(count < 5) return;
+    const { raw, maxPossible } = rawTasteSignal(m, maps);
+    preds.push(raw/maxPossible);
+    actuals.push(m.votes[person].score - 5.5);
+  });
+  const result = preds.length >= 6 ? { corr: pearson(preds, actuals), n: preds.length } : { corr: 0.35, n: preds.length };
+  _backtestCache[cacheKey] = result;
+  return result;
+}
+
+function estimateAffinity(movie, person){
+  const { maps, count } = buildTasteProfile(person, movie.id);
+  if(count < 6) return { ready:false, pct:50 };
+
+  const { raw:tasteRaw, maxPossible:tasteMax } = rawTasteSignal(movie, maps);
+  let raw = tasteRaw, maxPossible = tasteMax;
+
+  // Camada de segurança: consenso de crítica externa (evita "gênero combina" mas o filme é objetivamente ruim)
+  const criticScores = [movie.ratings.imdb, movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
+  if(criticScores.length){
+    const avgCritic = criticScores.reduce((a,b)=>a+b,0)/criticScores.length;
+    raw += (avgCritic-5.5) * 0.6;
+    maxPossible += 5*0.6;
+  }
 
   state.family.members.forEach(other=>{
     if(other===person) return;
@@ -1442,14 +1519,19 @@ function estimateAffinity(movie, person){
     maxPossible += Math.abs(contribution) + 1;
   });
 
-  const normalized = 50 + (raw/maxPossible)*50;
-  const pct = Math.max(3, Math.min(97, Math.round(normalized)));
+  // auto-validação: se o modelo historicamente não bate com as notas reais dessa pessoa, ele se contém
+  const { corr } = backtestAccuracy(person);
+  const reliability = Math.max(0.1, corr); // nunca deixa a confiança ir a zero total, mas dói pra correlação negativa/fraca
+
+  const overallConfidence = Math.min(1, count/15);
+  const deviation = (raw/maxPossible) * 50 * overallConfidence * reliability;
+  const pct = Math.max(5, Math.min(95, Math.round(50 + deviation)));
   return { ready:true, pct };
 }
 
 function computeRecommendations(){
   const myRatedCount = state.movies.filter(m=>m.votes[state.me] && m.votes[state.me].score!=null).length;
-  if(myRatedCount < 3) return { ready:false, items:[] };
+  if(myRatedCount < 6) return { ready:false, items:[] };
   const candidates = state.movies.filter(m => !(m.votes[state.me] && m.votes[state.me].score!=null) && !(m.hiddenBy && m.hiddenBy.includes(state.me)));
   const scored = candidates.map(m=>({ m, pct: estimateAffinity(m, state.me).pct }));
   scored.sort((a,b)=>b.pct - a.pct);
@@ -1465,12 +1547,14 @@ function renderRecommendationsModal(){
       <div class="modal-header"><h2>✨ Recomendados</h2><button class="close-x" onclick="__closeRecommendations()">×</button></div>
       ${!ready ? `
         <p style="color:var(--muted);font-size:13.5px;line-height:1.5">
-          Dê nota a pelo menos 3 filmes para eu conseguir estimar o que combina com o seu gosto.
-          Isso não é uma IA de verdade prevendo o futuro — é um cálculo comparando os gêneros e diretores
-          que você mais gostou com o resto do catálogo. Quanto mais você avaliar, mais precisa fica a estimativa.
+          Dê nota a pelo menos 6 filmes para eu conseguir estimar o que combina com o seu gosto.
+          Isso não é uma IA de verdade prevendo o futuro — é um cálculo comparando gêneros, diretores, atores,
+          roteiristas, país, década, produtora e o quanto seu gosto se parece com o dos outros da família,
+          além de conferir a nota da crítica como segurança extra. Quanto mais você avaliar, mais precisa fica a estimativa —
+          e o próprio algoritmo se testa contra suas notas reais pra saber se pode confiar em si mesmo.
         </p>
       ` : `
-        <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus próprios votos (gêneros, diretores, nota do IMDb) — não é garantia, é uma sugestão.</p>
+        <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus votos, na crítica especializada e em quão parecido seu gosto é com o dos outros — não é garantia, é uma sugestão.</p>
         ${items.map(({m,pct})=>`
           <div class="ticket" onclick="__closeRecommendations(); __openMovie('${m.id}')" style="margin:10px 0">
             ${m.poster?`<img class="poster" src="${m.poster}">`:`<div class="poster-ph">🎬</div>`}
