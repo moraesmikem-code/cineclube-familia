@@ -179,6 +179,7 @@
     color:var(--muted);font-size:20px;cursor:pointer;
   }
   .like-toggle button.on-like{background:rgba(76,154,106,0.18);border-color:var(--like);color:var(--like);}
+  .like-toggle button.on-neutral{background:rgba(212,167,44,0.18);border-color:var(--gold);color:var(--gold);}
   .like-toggle button.on-dislike{background:rgba(184,76,63,0.18);border-color:var(--dislike);color:var(--dislike);}
   .score-slider{width:100%;}
   .score-value{text-align:center;font-size:32px;color:var(--gold);font-family:'Bebas Neue';margin-top:4px;}
@@ -220,6 +221,7 @@ const KEY_MAP = {
   'omdb-key':      ['config','omdbKey'],
   'tmdb-key':       ['config','tmdbKey'],
   'movies-v1':      ['movies','json'],
+  'watchlists-v1':  ['watchlists','json'],
 };
 
 async function fbGet(key){
@@ -273,7 +275,7 @@ let state = {
   view: 'catalog',
   sortField: 'added',
   sortDir: 'desc',
-  filters: { genres: [], status: 'all', statusWho: 'all', mediaType: 'all', ratingOn:false, ratingSource:'', ratingValue:7 },
+  filters: { genres: [], status: 'all', statusWho: 'all', mediaType: 'all', decade:'all', continent:'all', language:'all', ratingOn:false, ratingSource:'', ratingValue:7 },
   search: '',
   modalMovie: null,
   addFlow: null,        // {step, url, data, error, loading}
@@ -292,6 +294,16 @@ function altTitlesLine(m){
   return parts.join(' · ');
 }
 function displaySynopsis(m){ return m.synopsisPt || m.plot || ''; }
+function normalizeLiked(v){
+  if(v===true) return 'like';
+  if(v===false) return 'dislike';
+  if(v==='like'||v==='neutral'||v==='dislike') return v;
+  return null;
+}
+function likedIcon(v){
+  const n = normalizeLiked(v);
+  return n==='like' ? '👍' : n==='neutral' ? '😐' : n==='dislike' ? '👎' : '';
+}
 
 /* ---------- INIT ---------- */
 async function init(){
@@ -299,11 +311,13 @@ async function init(){
   const key = await sGet('omdb-key', true);
   const tmdbKey = await sGet('tmdb-key', true);
   const movies = await sGet('movies-v1', true);
+  const watchlists = await sGet('watchlists-v1', true);
   const me = await sGet('my-identity', false);
   state.family = fam ? JSON.parse(fam) : null;
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
   state.movies = movies ? JSON.parse(movies) : [];
+  state.watchlists = watchlists ? JSON.parse(watchlists) : {};
   state.me = me || null;
   state.booted = true;
   render();
@@ -322,12 +336,12 @@ async function fetchOmdb(imdbId){
   if(data.Response === 'False'){
     throw new Error(data.Error || 'Filme não encontrado.');
   }
-  let rt = null;
+  let rtCritics = null;
   if(Array.isArray(data.Ratings)){
     const found = data.Ratings.find(r => r.Source === 'Rotten Tomatoes');
     if(found){
       const pct = parseInt(found.Value);
-      if(!isNaN(pct)) rt = Math.round((pct/10)*10)/10;
+      if(!isNaN(pct)) rtCritics = Math.round((pct/10)*10)/10;
     }
   }
   const imdbRating = (data.imdbRating && data.imdbRating !== 'N/A') ? parseFloat(data.imdbRating) : null;
@@ -337,6 +351,8 @@ async function fetchOmdb(imdbId){
     const d = new Date(data.Released);
     if(!isNaN(d)) releaseDate = d.toISOString();
   }
+  const countries = (data.Country && data.Country !== 'N/A') ? data.Country.split(',').map(c=>c.trim()) : [];
+  const languages = (data.Language && data.Language !== 'N/A') ? data.Language.split(',').map(l=>l.trim()) : [];
   return {
     imdbId,
     type: (data.Type === 'series') ? 'series' : 'movie',
@@ -348,9 +364,10 @@ async function fetchOmdb(imdbId){
     writer: (data.Writer && data.Writer !== 'N/A') ? data.Writer : '',
     actors: (data.Actors && data.Actors !== 'N/A') ? data.Actors : '',
     genres: (data.Genre && data.Genre !== 'N/A') ? data.Genre.split(',').map(g=>translateGenre(g.trim())) : [],
+    countries, languages,
     runtimeMin,
     releaseDate,
-    ratings: { imdb: imdbRating, rt: rt, letterboxd: null }
+    ratings: { imdb: imdbRating, rtCritics: rtCritics, rtAudience: null, letterboxd: null }
   };
 }
 
@@ -421,6 +438,7 @@ async function fetchAllSources(imdbId){
     synopsisAuto,
     director: omdb.director, writer: omdb.writer, actors: omdb.actors,
     genres: omdb.genres, runtimeMin: omdb.runtimeMin, releaseDate: omdb.releaseDate,
+    countries: omdb.countries, languages: omdb.languages,
     ratings: omdb.ratings
   };
 }
@@ -441,6 +459,34 @@ function isWatched(movie){
   if(movie.checkins && state.family.members.some(m => !!movie.checkins[m])) return true;
   return state.family.members.some(m => movie.votes[m] && (movie.votes[m].score!=null || movie.votes[m].liked!=null));
 }
+const COUNTRY_CONTINENT = {
+  'United States':'América do Norte','USA':'América do Norte','Canada':'América do Norte','Mexico':'América do Norte',
+  'Brazil':'América do Sul','Argentina':'América do Sul','Chile':'América do Sul','Colombia':'América do Sul','Peru':'América do Sul','Uruguay':'América do Sul','Venezuela':'América do Sul','Bolivia':'América do Sul','Ecuador':'América do Sul','Paraguay':'América do Sul',
+  'United Kingdom':'Europa','UK':'Europa','France':'Europa','Germany':'Europa','West Germany':'Europa','Italy':'Europa','Spain':'Europa','Portugal':'Europa','Netherlands':'Europa','Belgium':'Europa','Sweden':'Europa','Norway':'Europa','Denmark':'Europa','Finland':'Europa','Ireland':'Europa','Switzerland':'Europa','Austria':'Europa','Poland':'Europa','Russia':'Europa','Soviet Union':'Europa','Greece':'Europa','Hungary':'Europa','Czech Republic':'Europa','Czechoslovakia':'Europa','Romania':'Europa','Ukraine':'Europa','Iceland':'Europa','Croatia':'Europa','Serbia':'Europa','Yugoslavia':'Europa','Bulgaria':'Europa',
+  'Japan':'Ásia','China':'Ásia','Hong Kong':'Ásia','South Korea':'Ásia','India':'Ásia','Thailand':'Ásia','Taiwan':'Ásia','Indonesia':'Ásia','Philippines':'Ásia','Vietnam':'Ásia','Israel':'Ásia','Iran':'Ásia','Turkey':'Ásia','Malaysia':'Ásia','Singapore':'Ásia','Pakistan':'Ásia','Saudi Arabia':'Ásia','United Arab Emirates':'Ásia','Lebanon':'Ásia',
+  'South Africa':'África','Nigeria':'África','Egypt':'África','Morocco':'África','Kenya':'África','Tunisia':'África','Senegal':'África',
+  'Australia':'Oceania','New Zealand':'Oceania',
+};
+function countryToContinent(c){ return COUNTRY_CONTINENT[c] || null; }
+function allContinents(){
+  const set = new Set();
+  state.movies.forEach(m => (m.countries||[]).forEach(c=>{ const cont = countryToContinent(c); if(cont) set.add(cont); }));
+  return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
+}
+function allLanguages(){
+  const set = new Set();
+  state.movies.forEach(m => (m.languages||[]).forEach(l=>set.add(l)));
+  return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
+}
+function allDecades(){
+  const set = new Set();
+  state.movies.forEach(m=>{
+    const y = parseInt(m.year);
+    if(!isNaN(y)) set.add(Math.floor(y/10)*10);
+  });
+  return Array.from(set).sort((a,b)=>b-a);
+}
+
 const GENRE_MAP = {
   'Action':'Ação', 'Adventure':'Aventura', 'Animation':'Animação', 'Biography':'Biografia',
   'Comedy':'Comédia', 'Crime':'Policial', 'Documentary':'Documentário', 'Drama':'Drama',
@@ -470,7 +516,8 @@ function sortOptions(){
     {v:'alpha', l:'Ordem alfabética'},
     {v:'runtime', l:'Duração do filme'},
     {v:'imdb', l:'Nota do IMDb'},
-    {v:'rt', l:'Nota do Rotten Tomatoes'},
+    {v:'rtCritics', l:'Nota do Rotten Tomatoes (críticos)'},
+    {v:'rtAudience', l:'Nota do Rotten Tomatoes (público)'},
     {v:'letterboxd', l:'Nota do Letterboxd'},
   ];
   state.family.members.forEach(m => opts.push({v:'member:'+m, l:'Nota dada por '+m}));
@@ -480,13 +527,15 @@ function ratingSourceOptions(){
   const opts = state.family.members.map(m=>({v:'member:'+m, l:'Nota de '+m}));
   opts.push({v:'avg', l:'Média da Família'});
   opts.push({v:'imdb', l:'IMDb'});
-  opts.push({v:'rt', l:'Rotten Tomatoes'});
+  opts.push({v:'rtCritics', l:'Rotten Tomatoes (críticos)'});
+  opts.push({v:'rtAudience', l:'Rotten Tomatoes (público)'});
   opts.push({v:'letterboxd', l:'Letterboxd'});
   return opts;
 }
 
 function getFilteredSorted(){
   let list = state.movies.slice();
+  list = list.filter(m => !(m.hiddenBy && m.hiddenBy.includes(state.me)));
   const f = state.filters;
   if(state.search.trim()){
     const q = state.search.trim().toLowerCase();
@@ -494,6 +543,15 @@ function getFilteredSorted(){
   }
   if(f.mediaType !== 'all'){
     list = list.filter(m => (m.type || 'movie') === f.mediaType);
+  }
+  if(f.decade !== 'all'){
+    list = list.filter(m => { const y=parseInt(m.year); return !isNaN(y) && Math.floor(y/10)*10 === Number(f.decade); });
+  }
+  if(f.continent !== 'all'){
+    list = list.filter(m => (m.countries||[]).some(c => countryToContinent(c) === f.continent));
+  }
+  if(f.language !== 'all'){
+    list = list.filter(m => (m.languages||[]).includes(f.language));
   }
   if(f.genres.length){
     list = list.filter(m => (m.genres||[]).some(g => f.genres.includes(g)));
@@ -531,7 +589,8 @@ function getFilteredSorted(){
       case 'alpha': return displayTitle(m).toLowerCase();
       case 'runtime': return m.runtimeMin || 0;
       case 'imdb': return m.ratings.imdb ?? -1;
-      case 'rt': return m.ratings.rt ?? -1;
+      case 'rtCritics': return m.ratings.rtCritics ?? -1;
+      case 'rtAudience': return m.ratings.rtAudience ?? -1;
       case 'letterboxd': return m.ratings.letterboxd ?? -1;
       default:
         if(state.sortField.startsWith('member:')){
@@ -552,7 +611,7 @@ function getFilteredSorted(){
 
 /* ---------- RENDER ---------- */
 function removeOverlays(){
-  ['add-overlay','movie-overlay','settings-overlay'].forEach(id=>{
+  ['add-overlay','movie-overlay','settings-overlay','watchlist-overlay','reco-overlay','import-overlay'].forEach(id=>{
     const el = document.getElementById(id);
     if(el) el.remove();
   });
@@ -567,6 +626,9 @@ function render(){
   if(state.modalMovie) renderMovieModal(state.modalMovie);
   if(state.addFlow) renderAddModal();
   if(state.settingsOpen) renderSettingsModal();
+  if(state.watchlistsOpen) renderWatchlistModal();
+  if(state.recommendationsOpen) renderRecommendationsModal();
+  if(state.importOpen) renderImportModal();
 }
 
 function renderFamilySetup(){
@@ -637,6 +699,10 @@ function renderMain(){
         </div>
         <div class="identity-pill" onclick="__openSettings()"><span class="dot"></span>${state.me} ⚙︎</div>
       </div>
+      <div class="toolbar">
+        <button class="btn btn-ghost btn-sm" onclick="__openWatchlists()">📋 Prioridades</button>
+        <button class="btn btn-ghost btn-sm" onclick="__openRecommendations()">✨ Recomendados</button>
+      </div>
       <div class="search-box">
         <input type="text" placeholder="Buscar por título..." value="${escapeAttr(state.search)}" oninput="__setSearch(this.value)">
       </div>
@@ -661,6 +727,29 @@ function renderMain(){
         <div class="chip ${f.mediaType==='movie'?'active':''}" onclick="__setMediaType('movie')">Filmes</div>
         <div class="chip ${f.mediaType==='series'?'active':''}" onclick="__setMediaType('series')">Séries</div>
       </div>
+
+      <div class="field-inline">
+        <div>
+          <label>Década</label>
+          <select onchange="__setDecade(this.value)">
+            <option value="all">Todas</option>
+            ${allDecades().map(d=>`<option value="${d}" ${f.decade==String(d)?'selected':''}>${d}s</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label>Continente</label>
+          <select onchange="__setContinent(this.value)">
+            <option value="all">Todos</option>
+            ${allContinents().map(c=>`<option value="${c}" ${f.continent===c?'selected':''}>${c}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <label>Idioma principal</label>
+      <select onchange="__setLanguage(this.value)">
+        <option value="all">Todos</option>
+        ${allLanguages().map(l=>`<option value="${l}" ${f.language===l?'selected':''}>${l}</option>`).join('')}
+      </select>
+      <div class="hint">Década, continente e idioma são calculados a partir dos filmes já adicionados no catálogo.</div>
 
       <label>Status</label>
       <div class="radio-row">
@@ -723,6 +812,9 @@ function renderMain(){
   window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; render(); };
   window.__setStatusWho = (v)=>{ state.filters.statusWho=v; render(); };
   window.__setMediaType = (v)=>{ state.filters.mediaType=v; render(); };
+  window.__setDecade = (v)=>{ state.filters.decade=v; render(); };
+  window.__setContinent = (v)=>{ state.filters.continent=v; render(); };
+  window.__setLanguage = (v)=>{ state.filters.language=v; render(); };
   window.__toggleGenre = (g)=>{
     const i = state.filters.genres.indexOf(g);
     if(i>=0) state.filters.genres.splice(i,1); else state.filters.genres.push(g);
@@ -733,6 +825,8 @@ function renderMain(){
   window.__setRatingSource = (v)=>{ state.filters.ratingSource = v; render(); };
   window.__openAdd = ()=>{ state.addFlow = {step:'input', url:'', error:null, loading:false, data:null}; render(); };
   window.__openSettings = ()=>{ state.settingsOpen = true; render(); };
+  window.__openWatchlists = ()=>{ state.watchlistsOpen = true; render(); };
+  window.__openRecommendations = ()=>{ state.recommendationsOpen = true; render(); };
   window.__openMovie = (id)=>{ state.modalMovie = id; render(); };
 }
 
@@ -750,7 +844,7 @@ function renderCard(m){
     if(!v || (v.score==null && v.liked==null)){
       return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="vote-empty">sem voto</span></div>`;
     }
-    const likeIcon = v.liked===true?'<span class="vote-like">👍</span>':v.liked===false?'<span class="vote-dislike">👎</span>':'';
+    const likeIcon = `<span>${likedIcon(v.liked)}</span>`;
     const scoreTxt = v.score!=null ? `<span class="score">${v.score}</span>` : '';
     return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span>${likeIcon}${scoreTxt}</div>`;
   }).join('');
@@ -769,7 +863,8 @@ function renderCard(m){
       <div class="genre-tags">${genres.map(g=>`<span>${g}</span>`).join('')}</div>
       <div class="ratings-row">
         ${ratingChip('IMDb', m.ratings.imdb)}
-        ${ratingChip('RT', m.ratings.rt)}
+        ${ratingChip('RT Crít.', m.ratings.rtCritics)}
+        ${ratingChip('RT Púb.', m.ratings.rtAudience)}
         ${ratingChip('Letterboxd', m.ratings.letterboxd)}
       </div>
       ${checkinHtml}
@@ -806,6 +901,16 @@ function renderAddModal(){
       </button>
       ${af.loading ? '<div class="loading-spin"></div>' : ''}
     `;
+  } else if(af.step === 'duplicate'){
+    const existing = af.existingMovie;
+    inner = `
+      <img class="modal-poster" src="${existing.poster || ''}" onerror="this.style.display='none'">
+      <h3 style="margin:0 0 10px">${escapeHtml(displayTitle(existing))}</h3>
+      <div class="msg-error">Esse título já está no catálogo — foi adicionado antes.</div>
+      <p style="font-size:13.5px;color:var(--muted);margin-top:10px">Se você já assistiu, é só abrir o filme e registrar seu voto e check-in — não precisa adicionar de novo.</p>
+      <button class="btn btn-gold btn-block" style="margin-top:16px" onclick="__closeAdd(); __openMovie('${existing.id}')">Abrir e avaliar</button>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeAdd()">Fechar</button>
+    `;
   } else if(af.step === 'confirm'){
     const d = af.data;
     const displayTitle = d.titlePt || d.titleOriginal;
@@ -823,6 +928,8 @@ function renderAddModal(){
         <p><b>Roteirista:</b> ${escapeHtml(d.writer)||'—'}</p>
         <p><b>Elenco:</b> ${escapeHtml(d.actors)||'—'}</p>
         <p><b>Gêneros:</b> ${(d.genres||[]).join(', ')||'—'}</p>
+        <p><b>País:</b> ${(d.countries||[]).join(', ')||'—'}</p>
+        <p><b>Idioma:</b> ${(d.languages||[]).join(', ')||'—'}</p>
         <p><b>Duração:</b> ${d.runtimeMin?d.runtimeMin+' min':'—'}</p>
       </div>
       <div class="divider"></div>
@@ -832,13 +939,21 @@ function renderAddModal(){
           <input type="text" value="${d.ratings.imdb ?? ''}" disabled>
         </div>
         <div>
-          <label style="margin-top:0">Rotten Tomatoes (0–10)</label>
-          <input type="number" step="0.1" min="0" max="10" id="rt-input" value="${d.ratings.rt ?? ''}" placeholder="ex: 7.5">
+          <label style="margin-top:0">RT Críticos (0–10)</label>
+          <input type="number" step="0.1" min="0" max="10" id="rt-critics-input" value="${d.ratings.rtCritics ?? ''}" placeholder="ex: 7.5">
         </div>
       </div>
-      <label>Letterboxd (0–10)</label>
-      <input type="number" step="0.1" min="0" max="10" id="letterboxd-input" placeholder="ex: 3.8★ = 7.6">
-      <div class="hint">O Letterboxd e, às vezes, o Rotten Tomatoes não têm API pública — confira no site e digite a nota multiplicada para a escala 0–10 (ex: RT 75% = 7.5; Letterboxd 3.8★ = 7.6).</div>
+      <div class="field-inline">
+        <div>
+          <label style="margin-top:0">RT Público (0–10)</label>
+          <input type="number" step="0.1" min="0" max="10" id="rt-audience-input" placeholder="ex: 8.2">
+        </div>
+        <div>
+          <label style="margin-top:0">Letterboxd (0–10)</label>
+          <input type="number" step="0.1" min="0" max="10" id="letterboxd-input" placeholder="ex: 3.8★ = 7.6">
+        </div>
+      </div>
+      <div class="hint">Letterboxd e a nota do público do RT não têm API pública — confira no site e digite (ex: RT 75% = 7.5; Letterboxd 3.8★ = 7.6). Pode deixar em branco e preencher depois.</div>
       <button class="btn btn-gold btn-block" style="margin-top:16px" onclick="__confirmAdd()">Adicionar ao catálogo</button>
     `;
   }
@@ -857,6 +972,8 @@ function renderAddModal(){
     const val = document.getElementById('imdb-url').value.trim();
     const id = extractImdbId(val);
     if(!id){ state.addFlow.error='Não encontrei um ID válido do IMDb nesse link (deve conter algo como tt1234567).'; render(); return; }
+    const existing = state.movies.find(m=>m.imdbId===id);
+    if(existing){ state.addFlow.step='duplicate'; state.addFlow.existingMovie=existing; render(); return; }
     state.addFlow.loading = true; state.addFlow.error=null; state.addFlow.url=val; render();
     try{
       const data = await fetchAllSources(id);
@@ -867,9 +984,11 @@ function renderAddModal(){
   };
   window.__confirmAdd = async ()=>{
     const d = state.addFlow.data;
-    const rtVal = document.getElementById('rt-input').value;
+    const rtcVal = document.getElementById('rt-critics-input').value;
+    const rtaVal = document.getElementById('rt-audience-input').value;
     const lbVal = document.getElementById('letterboxd-input').value;
-    d.ratings.rt = rtVal!=='' ? parseFloat(rtVal) : d.ratings.rt;
+    d.ratings.rtCritics = rtcVal!=='' ? parseFloat(rtcVal) : d.ratings.rtCritics;
+    d.ratings.rtAudience = rtaVal!=='' ? parseFloat(rtaVal) : null;
     d.ratings.letterboxd = lbVal!=='' ? parseFloat(lbVal) : null;
     const movie = {
       id: uid(),
@@ -879,8 +998,9 @@ function renderAddModal(){
       year: d.year, poster: d.poster,
       synopsisPt: d.synopsisPt, synopsisAuto: d.synopsisAuto,
       director: d.director, writer: d.writer, actors: d.actors, genres: d.genres,
+      countries: d.countries||[], languages: d.languages||[],
       runtimeMin: d.runtimeMin, releaseDate: d.releaseDate, ratings: d.ratings,
-      addedAt: new Date().toISOString(), votes: {}
+      addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: []
     };
     state.family.members.forEach(m => movie.votes[m] = {liked:null, score:null});
     movie.checkins = {};
@@ -918,8 +1038,20 @@ function renderMovieModal(id){
         <p><b>Lançamento:</b> ${m.releaseDate?new Date(m.releaseDate).toLocaleDateString('pt-BR'):'—'}</p>
       </div>
       <div class="ratings-row" style="font-size:13px">
-        ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings.rt)} &nbsp; ${ratingChip('Letterboxd', m.ratings.letterboxd)}
+        ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('RT Críticos', m.ratings.rtCritics)} &nbsp; ${ratingChip('RT Público', m.ratings.rtAudience)} &nbsp; ${ratingChip('Letterboxd', m.ratings.letterboxd)}
+        <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar notas externas</button>
       </div>
+      ${state._editingRatings===m.id ? `
+      <div class="vote-editor">
+        <h4>Editar notas externas</h4>
+        <div class="field-inline">
+          <div><label style="margin-top:0">RT Críticos (0–10)</label><input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings.rtCritics ?? ''}"></div>
+          <div><label style="margin-top:0">RT Público (0–10)</label><input type="number" step="0.1" min="0" max="10" id="edit-rta" value="${m.ratings.rtAudience ?? ''}"></div>
+        </div>
+        <label>Letterboxd (0–10)</label>
+        <input type="number" step="0.1" min="0" max="10" id="edit-lb" value="${m.ratings.letterboxd ?? ''}">
+        <button class="btn btn-gold btn-block" style="margin-top:12px" onclick="__saveExternalRatings('${m.id}')">Salvar notas</button>
+      </div>` : ''}
 
       <div class="vote-editor">
         <h4>Check-in</h4>
@@ -938,8 +1070,9 @@ function renderMovieModal(id){
       <div class="vote-editor">
         <h4>Seu voto (${state.me})</h4>
         <div class="like-toggle">
-          <button id="btn-like" class="${myVote.liked===true?'on-like':''}" onclick="__setLiked(true)">👍 Gostei</button>
-          <button id="btn-dislike" class="${myVote.liked===false?'on-dislike':''}" onclick="__setLiked(false)">👎 Não gostei</button>
+          <button id="btn-like" class="${normalizeLiked(myVote.liked)==='like'?'on-like':''}" onclick="__setLiked('like')">👍 Gostei</button>
+          <button id="btn-neutral" class="${normalizeLiked(myVote.liked)==='neutral'?'on-neutral':''}" onclick="__setLiked('neutral')">😐 Mediano</button>
+          <button id="btn-dislike" class="${normalizeLiked(myVote.liked)==='dislike'?'on-dislike':''}" onclick="__setLiked('dislike')">👎 Não gostei</button>
         </div>
         <label style="margin-top:0">Sua nota</label>
         <input type="range" min="1" max="10" step="1" class="score-slider" id="score-slider" value="${myVote.score ?? 5}" oninput="__previewScore(this.value)">
@@ -953,22 +1086,23 @@ function renderMovieModal(id){
           const v = m.votes[name];
           const has = v && (v.score!=null || v.liked!=null);
           const icon = !has ? '<span class="vote-empty">sem voto ainda</span>' :
-            `${v.liked===true?'👍':v.liked===false?'👎':''} ${v.score!=null?'<b style="color:var(--gold)">'+v.score+'/10</b>':''}`;
+            `${likedIcon(v.liked)} ${v.score!=null?'<b style="color:var(--gold)">'+v.score+'/10</b>':''}`;
           return `<div class="vote-line"><span>${name}</span><span>${icon}</span></div>`;
         }).join('')}
         <div class="vote-line"><span>Média da família</span><span><b style="color:var(--gold)">${familyAvg(m) ?? '—'}</b></span></div>
       </div>
 
-      <button class="btn btn-danger btn-block" style="margin-top:20px" onclick="__deleteMovie('${m.id}')">Remover filme do catálogo</button>
+      <button class="btn btn-danger btn-block" style="margin-top:20px" onclick="__deleteMovie('${m.id}')">Remover filme só da minha lista</button>
     </div>
   </div>`);
   document.getElementById('movie-overlay').addEventListener('click',(e)=>{ if(e.target.id==='movie-overlay') __closeMovie(); });
 
-  let pendingLiked = myVote.liked;
+  let pendingLiked = normalizeLiked(myVote.liked);
   window.__setLiked = (val)=>{
     pendingLiked = (pendingLiked===val) ? null : val;
-    document.getElementById('btn-like').className = pendingLiked===true?'on-like':'';
-    document.getElementById('btn-dislike').className = pendingLiked===false?'on-dislike':'';
+    document.getElementById('btn-like').className = pendingLiked==='like'?'on-like':'';
+    document.getElementById('btn-neutral').className = pendingLiked==='neutral'?'on-neutral':'';
+    document.getElementById('btn-dislike').className = pendingLiked==='dislike'?'on-dislike':'';
   };
   window.__previewScore = (v)=>{ document.getElementById('score-display').textContent = v; };
   window.__toggleCheckin = async (id)=>{
@@ -979,16 +1113,39 @@ function renderMovieModal(id){
     await sSet('movies-v1', JSON.stringify(state.movies), true);
     render();
   };
+  window.__toggleEditRatings = (id)=>{
+    state._editingRatings = (state._editingRatings===id) ? null : id;
+    render();
+  };
+  window.__saveExternalRatings = async (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    const rtc = document.getElementById('edit-rtc').value;
+    const rta = document.getElementById('edit-rta').value;
+    const lb = document.getElementById('edit-lb').value;
+    movie.ratings.rtCritics = rtc!=='' ? parseFloat(rtc) : null;
+    movie.ratings.rtAudience = rta!=='' ? parseFloat(rta) : null;
+    movie.ratings.letterboxd = lb!=='' ? parseFloat(lb) : null;
+    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    state._editingRatings = null;
+    render();
+  };
   window.__saveVote = async ()=>{
     const score = parseInt(document.getElementById('score-slider').value);
     m.votes[state.me] = { liked: pendingLiked, score: score };
+    if(!m.checkins) m.checkins = {};
+    if(!m.checkins[state.me]) m.checkins[state.me] = new Date().toISOString();
     await sSet('movies-v1', JSON.stringify(state.movies), true);
     render();
   };
   window.__deleteMovie = async (id)=>{
-    if(!confirm('Remover este filme e todos os votos da família?')) return;
-    state.movies = state.movies.filter(x=>x.id!==id);
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    if(!confirm('Remover este filme só da SUA lista? Ele continua no catálogo dos outros, com os votos deles intactos.')) return;
+    const movie = state.movies.find(x=>x.id===id);
+    if(movie){
+      if(!movie.hiddenBy) movie.hiddenBy = [];
+      if(!movie.hiddenBy.includes(state.me)) movie.hiddenBy.push(state.me);
+      await sSet('movies-v1', JSON.stringify(state.movies), true);
+    }
     state.modalMovie = null;
     render();
   };
@@ -1023,6 +1180,11 @@ function renderSettingsModal(){
       </div>
       <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__saveTmdbKey()">Salvar chave TMDB</button>
       <div id="tmdb-key-msg"></div>
+
+      <div class="divider"></div>
+      <label style="margin-top:0">Importar avaliações do IMDb</label>
+      <div class="hint">Já avaliou centenas de filmes no IMDb? Importe tudo de uma vez, com sua nota já aplicada.</div>
+      <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__closeSettings(); __openImport();">📥 Importar do IMDb</button>
 
       <div class="divider"></div>
       <label style="margin-top:0">Membros da família</label>
@@ -1065,6 +1227,373 @@ function renderSettingsModal(){
     render();
   };
 }
+
+/* ---------- WATCHLISTS (Pastas de Prioridade) ---------- */
+function renderWatchlistModal(){
+  const wl = state.watchlists || {};
+  const mine = wl[state.me] || { public: true, items: [] };
+  document.body.insertAdjacentHTML('beforeend', `
+  <div class="overlay" id="watchlist-overlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><h2>📋 Prioridades</h2><button class="close-x" onclick="__closeWatchlists()">×</button></div>
+      <p style="font-size:13px;color:var(--muted);margin-top:-6px">Sua lista de "quero assistir com prioridade" — sem limite de itens.</p>
+
+      <div class="panel">
+        <h3 style="font-size:18px">Minha pasta</h3>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:0;cursor:pointer" onclick="__toggleWatchlistPublic()">
+          <input type="checkbox" ${mine.public?'checked':''} style="width:auto"> Deixar minha pasta pública (outros podem ver)
+        </label>
+        <div class="field-inline" style="margin-top:10px">
+          <input type="text" id="wl-new-item" placeholder="Nome do filme/série">
+          <button class="btn btn-gold btn-sm" style="flex:0 0 auto" onclick="__addWatchlistItem()">Adicionar</button>
+        </div>
+        ${mine.items.length===0 ? `<p class="hint">Nada na sua pasta ainda.</p>` : `
+        <div style="margin-top:10px">
+          ${mine.items.map(it=>`
+            <div class="vote-line">
+              <span>${escapeHtml(it.text)}</span>
+              <button class="icon-btn" onclick="__removeWatchlistItem('${it.id}')">🗑️</button>
+            </div>`).join('')}
+        </div>`}
+      </div>
+
+      <div class="panel">
+        <h3 style="font-size:18px">Pastas dos outros</h3>
+        ${state.family.members.filter(m=>m!==state.me).map(name=>{
+          const theirs = wl[name];
+          if(!theirs || !theirs.public){
+            return `<div class="vote-line"><span>${name}</span><span class="vote-empty">🔒 privada</span></div>`;
+          }
+          if(theirs.items.length===0){
+            return `<div class="vote-line"><span>${name}</span><span class="vote-empty">pasta vazia</span></div>`;
+          }
+          return `
+            <div style="margin-bottom:12px">
+              <div style="font-weight:700;margin-bottom:4px">${name}</div>
+              ${theirs.items.map(it=>`<div class="vote-line"><span>${escapeHtml(it.text)}</span></div>`).join('')}
+            </div>`;
+        }).join('')}
+      </div>
+    </div>
+  </div>`);
+  document.getElementById('watchlist-overlay').addEventListener('click',(e)=>{ if(e.target.id==='watchlist-overlay') __closeWatchlists(); });
+
+  window.__closeWatchlists = ()=>{ state.watchlistsOpen=false; render(); };
+  window.__toggleWatchlistPublic = async ()=>{
+    if(!state.watchlists[state.me]) state.watchlists[state.me] = { public:true, items:[] };
+    state.watchlists[state.me].public = !state.watchlists[state.me].public;
+    await sSet('watchlists-v1', JSON.stringify(state.watchlists), true);
+    render(); state.watchlistsOpen = true; render();
+  };
+  window.__addWatchlistItem = async ()=>{
+    const input = document.getElementById('wl-new-item');
+    const text = input.value.trim();
+    if(!text) return;
+    if(!state.watchlists[state.me]) state.watchlists[state.me] = { public:true, items:[] };
+    state.watchlists[state.me].items.push({ id: uid(), text, addedAt: new Date().toISOString() });
+    await sSet('watchlists-v1', JSON.stringify(state.watchlists), true);
+    render(); state.watchlistsOpen = true; render();
+  };
+  window.__removeWatchlistItem = async (itemId)=>{
+    if(!state.watchlists[state.me]) return;
+    state.watchlists[state.me].items = state.watchlists[state.me].items.filter(it=>it.id!==itemId);
+    await sSet('watchlists-v1', JSON.stringify(state.watchlists), true);
+    render(); state.watchlistsOpen = true; render();
+  };
+}
+
+/* ---------- RECOMENDAÇÕES ---------- */
+function computeRecommendations(){
+  const myVotes = state.movies
+    .map(m=>({m, v:m.votes[state.me]}))
+    .filter(x=>x.v && x.v.score!=null);
+  if(myVotes.length < 3) return { ready:false, items:[] };
+
+  const genreScore = {};
+  const directorScore = {};
+  myVotes.forEach(({m,v})=>{
+    const weight = v.score - 5.5;
+    (m.genres||[]).forEach(g=>{ genreScore[g] = (genreScore[g]||0) + weight; });
+    if(m.director){
+      m.director.split(',').map(s=>s.trim()).forEach(d=>{ directorScore[d] = (directorScore[d]||0) + weight; });
+    }
+  });
+
+  const ratedIds = new Set(myVotes.map(x=>x.m.id));
+  const candidates = state.movies.filter(m => !ratedIds.has(m.id) && !(m.hiddenBy && m.hiddenBy.includes(state.me)));
+
+  const scored = candidates.map(m=>{
+    let raw = 0, maxPossible = 0.0001;
+    (m.genres||[]).forEach(g=>{
+      const s = genreScore[g] || 0;
+      raw += s;
+      maxPossible += Math.abs(s) + 1;
+    });
+    if(m.director){
+      m.director.split(',').map(s=>s.trim()).forEach(d=>{
+        const s = directorScore[d] || 0;
+        raw += s * 1.5;
+        maxPossible += (Math.abs(s)+1) * 1.5;
+      });
+    }
+    if(m.ratings.imdb!=null){ raw += (m.ratings.imdb - 5.5) * 0.4; maxPossible += 5*0.4; }
+    const normalized = 50 + (raw / maxPossible) * 50;
+    const pct = Math.max(3, Math.min(97, Math.round(normalized)));
+    return { m, pct };
+  });
+
+  scored.sort((a,b)=>b.pct - a.pct);
+  return { ready:true, items: scored.slice(0,15) };
+}
+
+function renderRecommendationsModal(){
+  const { ready, items } = computeRecommendations();
+  document.body.insertAdjacentHTML('beforeend', `
+  <div class="overlay" id="reco-overlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><h2>✨ Recomendados</h2><button class="close-x" onclick="__closeRecommendations()">×</button></div>
+      ${!ready ? `
+        <p style="color:var(--muted);font-size:13.5px;line-height:1.5">
+          Dê nota a pelo menos 3 filmes para eu conseguir estimar o que combina com o seu gosto.
+          Isso não é uma IA de verdade prevendo o futuro — é um cálculo comparando os gêneros e diretores
+          que você mais gostou com o resto do catálogo. Quanto mais você avaliar, mais precisa fica a estimativa.
+        </p>
+      ` : `
+        <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus próprios votos (gêneros, diretores, nota do IMDb) — não é garantia, é uma sugestão.</p>
+        ${items.map(({m,pct})=>`
+          <div class="ticket" onclick="__closeRecommendations(); __openMovie('${m.id}')" style="margin:10px 0">
+            ${m.poster?`<img class="poster" src="${m.poster}">`:`<div class="poster-ph">🎬</div>`}
+            <div class="ticket-body">
+              <h4>${escapeHtml(displayTitle(m))}</h4>
+              <div class="ticket-meta">${(m.genres||[]).slice(0,3).join(', ')}</div>
+              <div style="margin-top:6px;font-size:22px;font-family:'Bebas Neue';color:var(--gold)">${pct}% de afinidade</div>
+            </div>
+          </div>
+        `).join('')}
+        ${items.length===0 ? `<p class="hint">Nenhum filme novo no catálogo pra recomendar ainda — adicione mais títulos.</p>` : ''}
+      `}
+    </div>
+  </div>`);
+  document.getElementById('reco-overlay').addEventListener('click',(e)=>{ if(e.target.id==='reco-overlay') __closeRecommendations(); });
+  window.__closeRecommendations = ()=>{ state.recommendationsOpen=false; render(); };
+}
+
+/* ---------- IMPORTAÇÃO EM MASSA DO IMDB ---------- */
+function parseCSV(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i], next = text[i+1];
+    if(inQuotes){
+      if(c === '"' && next === '"'){ field+='"'; i++; }
+      else if(c === '"'){ inQuotes = false; }
+      else field += c;
+    } else {
+      if(c === '"'){ inQuotes = true; }
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else if(c === '\r'){ /* ignore */ }
+      else field += c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  if(rows.length===0) return [];
+  const headers = rows[0];
+  return rows.slice(1).filter(r=>r.length>1).map(r=>{
+    const obj = {};
+    headers.forEach((h,i)=>{ obj[h.trim()] = (r[i]||'').trim(); });
+    return obj;
+  });
+}
+
+function renderImportModal(){
+  const st = state.importState || { step:'upload' };
+  let inner = '';
+  if(st.step === 'upload'){
+    inner = `
+      <p style="font-size:13.5px;color:var(--muted);line-height:1.6">
+        <b>Como exportar do IMDb:</b><br>
+        1. No site do IMDb, acesse seu perfil → "Your Ratings"<br>
+        2. Toque nos três pontinhos (⋯) da lista → "Export"<br>
+        3. Um arquivo <code>ratings.csv</code> vai baixar no seu celular<br>
+        4. Selecione ele abaixo
+      </p>
+      <input type="file" id="csv-file-input" accept=".csv,text/csv" style="margin-top:10px">
+      <div id="import-parse-msg"></div>
+      <div class="hint" style="margin-top:10px">
+        Filmes que já estão no catálogo só recebem sua nota (sem gastar busca). Filmes novos são buscados na OMDb —
+        o plano grátis permite ~1000 buscas por dia, então listas muito grandes podem levar mais de um dia (dá pra continuar depois, do ponto que parou).
+      </div>
+    `;
+  } else if(st.step === 'preview'){
+    inner = `
+      <p style="font-size:14px">Encontrei <b style="color:var(--gold)">${st.total}</b> avaliações no arquivo.</p>
+      <p style="font-size:13.5px;color:var(--muted)">
+        <b>${st.alreadyInCatalog}</b> já estão no catálogo (só vou aplicar sua nota, rápido).<br>
+        <b>${st.toFetch}</b> são novas e precisam ser buscadas na OMDb (uma de cada vez, com calma).
+      </p>
+      ${!state.apiKey ? `<div class="msg-error">Configure a chave da OMDb antes de importar filmes novos.</div>` : ''}
+      <button class="btn btn-gold btn-block" style="margin-top:14px" onclick="__startImport()">Iniciar importação</button>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeImport()">Cancelar</button>
+    `;
+  } else if(st.step === 'running'){
+    const pct = st.queue.length ? Math.round((st.processed/st.queue.length)*100) : 100;
+    inner = `
+      <p style="font-size:14px">Importando... <b style="color:var(--gold)">${st.processed}/${st.queue.length}</b></p>
+      <div style="background:var(--panel2);border-radius:8px;height:10px;overflow:hidden;margin:10px 0">
+        <div style="background:var(--gold);height:100%;width:${pct}%"></div>
+      </div>
+      <p class="hint">Adicionados: ${st.added} · Erros: ${st.errors} · Deixe a tela aberta enquanto importa.</p>
+      <button class="btn btn-ghost btn-block" onclick="__pauseImport()">Pausar</button>
+    `;
+  } else if(st.step === 'paused'){
+    inner = `
+      <p style="font-size:14px">Pausado em <b style="color:var(--gold)">${st.processed}/${st.queue.length}</b>.</p>
+      <p class="hint">${st.dailyLimitHit ? 'Provavelmente batemos o limite diário grátis da OMDb (1000 buscas). Volte amanhã e continue de onde parou.' : 'Você pode continuar quando quiser.'}</p>
+      <button class="btn btn-gold btn-block" onclick="__resumeImport()">Continuar importação</button>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeImport()">Fechar por agora</button>
+    `;
+  } else if(st.step === 'done'){
+    inner = `
+      <p style="font-size:16px">✅ Importação concluída!</p>
+      <p style="color:var(--muted);font-size:13.5px">Adicionados: ${st.added} novos · Notas aplicadas em filmes já existentes: ${st.alreadyInCatalog} · Erros: ${st.errors}</p>
+      <button class="btn btn-gold btn-block" style="margin-top:14px" onclick="__closeImport()">Fechar</button>
+    `;
+  }
+  document.body.insertAdjacentHTML('beforeend', `
+  <div class="overlay" id="import-overlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><h2>📥 Importar do IMDb</h2><button class="close-x" onclick="__closeImport()">×</button></div>
+      ${inner}
+    </div>
+  </div>`);
+
+  window.__closeImport = ()=>{ state.importOpen=false; render(); };
+  window.__openImportFresh = ()=>{ state.importState = { step:'upload' }; state.importOpen = true; render(); };
+
+  if(st.step === 'upload'){
+    const fileInput = document.getElementById('csv-file-input');
+    if(fileInput){
+      fileInput.addEventListener('change', async (e)=>{
+        const file = e.target.files[0];
+        if(!file) return;
+        const text = await file.text();
+        const rows = parseCSV(text);
+        const idField = Object.keys(rows[0]||{}).find(k=>/const/i.test(k)) || 'Const';
+        const ratingField = Object.keys(rows[0]||{}).find(k=>/your rating/i.test(k)) || 'Your Rating';
+        const dateField = Object.keys(rows[0]||{}).find(k=>/date rated/i.test(k)) || 'Date Rated';
+        const existingIds = new Set(state.movies.map(m=>m.imdbId));
+        const queue = [];
+        let already = 0;
+        rows.forEach(r=>{
+          const imdbId = (r[idField]||'').trim();
+          const rating = parseInt(r[ratingField]);
+          if(!imdbId || isNaN(rating)) return;
+          if(existingIds.has(imdbId)){ already++; }
+          queue.push({ imdbId, rating, dateRated: r[dateField]||null, existing: existingIds.has(imdbId) });
+        });
+        state.importState = {
+          step:'preview', total: queue.length, alreadyInCatalog: already, toFetch: queue.length-already,
+          rawQueue: queue
+        };
+        render();
+      });
+    }
+  }
+}
+
+window.__openImport = ()=>{ state.importState = { step:'upload' }; state.importOpen = true; render(); };
+
+async function __applyExistingRating(entry){
+  const movie = state.movies.find(m=>m.imdbId===entry.imdbId);
+  if(!movie) return false;
+  if(!movie.votes) movie.votes = {};
+  movie.votes[state.me] = { liked: null, score: entry.rating };
+  if(!movie.checkins) movie.checkins = {};
+  if(!movie.checkins[state.me]) movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+  return true;
+}
+
+async function __runImportQueue(){
+  const st = state.importState;
+  st.step = 'running';
+  render();
+  while(st.processed < st.queue.length){
+    if(st.paused) return;
+    const entry = st.queue[st.processed];
+    try{
+      if(entry.existing){
+        await __applyExistingRating(entry);
+      } else {
+        if(!state.apiKey){ st.errors++; }
+        else {
+          const data = await fetchAllSources(entry.imdbId);
+          const movie = {
+            id: uid(), imdbId: entry.imdbId,
+            titleOriginal: data.titleOriginal, titleEn: data.titleEn, titlePt: data.titlePt,
+            type: data.type || 'movie', year: data.year, poster: data.poster,
+            synopsisPt: data.synopsisPt, synopsisAuto: data.synopsisAuto,
+            director: data.director, writer: data.writer, actors: data.actors, genres: data.genres,
+            countries: data.countries||[], languages: data.languages||[],
+            runtimeMin: data.runtimeMin, releaseDate: data.releaseDate, ratings: data.ratings,
+            addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: []
+          };
+          state.family.members.forEach(m => movie.votes[m] = {liked:null, score:null});
+          movie.votes[state.me] = { liked: null, score: entry.rating };
+          movie.checkins = {};
+          state.family.members.forEach(m => movie.checkins[m] = null);
+          movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+          state.movies.push(movie);
+          st.added++;
+          st.omdbCallsToday = (st.omdbCallsToday||0) + 1;
+        }
+      }
+    }catch(e){
+      st.errors++;
+      if(/limit|429|quota/i.test(e.message||'')){
+        st.dailyLimitHit = true;
+        st.paused = true;
+        st.step = 'paused';
+        await sSet('movies-v1', JSON.stringify(state.movies), true);
+        render();
+        return;
+      }
+    }
+    st.processed++;
+    if(st.processed % 8 === 0){
+      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      render();
+    }
+    if(!entry.existing && (st.omdbCallsToday||0) >= 950){
+      st.dailyLimitHit = true;
+      st.paused = true;
+      st.step = 'paused';
+      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      render();
+      return;
+    }
+    await new Promise(res=>setTimeout(res, 350));
+  }
+  await sSet('movies-v1', JSON.stringify(state.movies), true);
+  st.step = 'done';
+  render();
+}
+
+window.__startImport = ()=>{
+  const raw = state.importState.rawQueue;
+  state.importState.queue = raw;
+  state.importState.processed = 0;
+  state.importState.added = 0;
+  state.importState.errors = 0;
+  state.importState.paused = false;
+  state.importState.omdbCallsToday = 0;
+  __runImportQueue();
+};
+window.__pauseImport = ()=>{ state.importState.paused = true; state.importState.step='paused'; render(); };
+window.__resumeImport = ()=>{ state.importState.paused = false; state.importState.omdbCallsToday = 0; __runImportQueue(); };
 
 init();
 })();
