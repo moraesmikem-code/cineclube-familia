@@ -1050,6 +1050,7 @@ function renderMovieModal(id){
       <div class="ratings-row" style="font-size:13px">
         ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings.metacritic)}
         <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar nota do RT</button>
+        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar dados externos</button>
       </div>
       ${(()=>{
         const myV = m.votes[state.me];
@@ -1143,6 +1144,27 @@ function renderMovieModal(id){
   window.__toggleEditRatings = (id)=>{
     state._editingRatings = (state._editingRatings===id) ? null : id;
     render();
+  };
+  window.__refreshExternalData = async (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    if(!state.apiKey){
+      alert('Configure a chave da OMDb em Configurações antes de atualizar.');
+      return;
+    }
+    try{
+      const fresh = await fetchOmdb(movie.imdbId);
+      movie.ratings.imdb = fresh.ratings.imdb ?? movie.ratings.imdb;
+      movie.ratings.rtCritics = fresh.ratings.rtCritics ?? movie.ratings.rtCritics;
+      movie.ratings.metacritic = fresh.ratings.metacritic ?? movie.ratings.metacritic;
+      if(fresh.countries && fresh.countries.length) movie.countries = fresh.countries;
+      if(fresh.languages && fresh.languages.length){ movie.languages = fresh.languages; movie.primaryLanguage = fresh.languages[0]; }
+      if(fresh.production) movie.production = fresh.production;
+      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      render();
+    }catch(e){
+      alert('Não consegui atualizar agora: ' + (e.message||'erro desconhecido'));
+    }
   };
   window.__saveExternalRatings = async (id)=>{
     const movie = state.movies.find(x=>x.id===id);
@@ -1712,17 +1734,25 @@ function explainRecommendation(movie, person){
   }
 
   const { corr } = backtestAccuracy(person);
-  if(corr < 0.25 && down.length<4){
-    down.push('O algoritmo ainda não tem muita certeza dos padrões do seu gosto — precisa de mais avaliações suas pra ganhar confiança');
+  const reliability = Math.max(0.1, corr);
+  const overallConfidence = Math.min(1, count/15);
+  const combinedConfidence = reliability * overallConfidence;
+
+  if(count < 15){
+    down.push(`Você avaliou ${count} filme(s) até agora — a % fica mais assertiva conforme você avalia mais (o ideal é passar de 15)`);
   }
-  if(count < 15 && down.length<4){
-    down.push(`Você avaliou ${count} filme(s) até agora — a % fica mais assertiva conforme você avalia mais`);
+  if(corr < 0.5){
+    down.push('O algoritmo ainda está com confiança moderada nos padrões do seu gosto — avalie mais filmes parecidos pra ele ganhar certeza');
+  }
+  // Sempre explica o efeito da confiança geral na %, mesmo quando não há um motivo negativo "nomeável"
+  if(combinedConfidence < 0.85){
+    down.push(`Nível de confiança atual do algoritmo pra você: ${Math.round(combinedConfidence*100)}% — isso "segura" a % pra não subir ou descer demais até ter mais certeza`);
   }
   if(up.length===0 && down.length===0){
     down.push('Não encontrei padrões fortes o suficiente pra puxar a % pra cima ou pra baixo com confiança');
   }
 
-  return { up: up.slice(0,4), down: down.slice(0,4) };
+  return { up: up.slice(0,4), down: down.slice(0,5) };
 }
 
 function renderRecommendationsModal(){
