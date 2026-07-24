@@ -1055,7 +1055,9 @@ function renderMovieModal(id){
         const myV = m.votes[state.me];
         if(myV && myV.score!=null) return `<div class="hint" style="margin:6px 0 10px">Você já avaliou este título (nota ${myV.score}/10) — recomendação só aparece pra filmes ainda não avaliados por você.</div>`;
         const r=estimateAffinity(m,state.me);
-        return r.ready ? `<div style="margin:6px 0 10px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>` : `<div class="hint" style="margin:6px 0 10px">Avalie pelo menos 6 filmes pra eu conseguir estimar uma recomendação com confiança.</div>`;
+        if(!r.ready) return `<div class="hint" style="margin:6px 0 10px">Avalie pelo menos 6 filmes pra eu conseguir estimar uma recomendação com confiança.</div>`;
+        const { up, down } = explainRecommendation(m, state.me);
+        return `<div style="margin:6px 0 4px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>${explanationHtml(up, down)}`;
       })()}
       ${state._editingRatings===m.id ? `
       <div class="vote-editor">
@@ -1654,36 +1656,73 @@ function computeRecommendations(){
   return { ready:true, items: scored.slice(0,15) };
 }
 
+function explanationHtml(up, down){
+  if(up.length===0 && down.length===0) return '';
+  let html = '<div style="margin-top:8px;font-size:12px">';
+  if(up.length){
+    html += `<div style="color:var(--like);font-weight:600;margin-bottom:2px">O que puxa pra cima:</div>
+      <ul style="margin:0 0 6px;padding-left:16px;color:var(--muted)">${up.map(r=>`<li>${escapeHtml(r)}</li>`).join('')}</ul>`;
+  }
+  if(down.length){
+    html += `<div style="color:var(--dislike);font-weight:600;margin-bottom:2px">O que está segurando a %:</div>
+      <ul style="margin:0;padding-left:16px;color:var(--muted)">${down.map(r=>`<li>${escapeHtml(r)}</li>`).join('')}</ul>`;
+  }
+  html += '</div>';
+  return html;
+}
+
 function explainRecommendation(movie, person){
-  const { maps } = buildTasteProfile(person, movie.id);
-  const reasons = [];
-  function topReason(map, keys, prefix){
-    let best=null;
+  const { maps, count } = buildTasteProfile(person, movie.id);
+  const up = [], down = [];
+
+  function topReason(map, keys, prefixUp, prefixDown){
+    let best=null, worst=null;
     keys.forEach(k=>{
       const entry = map[k];
       if(!entry || entry.n<2) return;
       const w = shrunkWeight(entry);
       if(w>1.4 && (!best || w>best.w)) best = {k, w};
+      if(w<-1.2 && (!worst || w<worst.w)) worst = {k, w};
     });
-    if(best) reasons.push(`${prefix} ${best.k}`);
+    if(best) up.push(`${prefixUp} ${best.k}`);
+    if(worst) down.push(`${prefixDown} ${worst.k}`);
   }
-  topReason(maps.genre, movie.genres||[], 'Você costuma gostar de');
-  if(movie.director) topReason(maps.director, movie.director.split(',').map(s=>s.trim()), 'Você gosta dos trabalhos de');
-  if(movie.actors) topReason(maps.actor, movie.actors.split(',').map(s=>s.trim()), 'Você gosta de filmes com');
+  topReason(maps.genre, movie.genres||[], 'Você costuma gostar de', 'Você costuma não gostar tanto de');
+  if(movie.director) topReason(maps.director, movie.director.split(',').map(s=>s.trim()), 'Você gosta dos trabalhos de', 'Filmes do diretor');
+  if(movie.actors) topReason(maps.actor, movie.actors.split(',').map(s=>s.trim()), 'Você gosta de filmes com', 'Filmes com');
+
+  let anyStrongCrossUser = false;
   state.family.members.forEach(other=>{
-    if(other===person || reasons.length>=4) return;
+    if(other===person) return;
     const v = movie.votes[other];
-    if(v && v.score!=null && v.score>=8){
+    if(v && v.score!=null){
       const aff = crossUserAffinityFor(person, other, movie);
-      if(aff>0.35) reasons.push(`${other} deu nota ${v.score} e o gosto de vocês combina bastante nesse tipo de filme`);
+      if(v.score>=8 && aff>0.35 && up.length<4){ up.push(`${other} deu nota ${v.score} e o gosto de vocês combina bastante nesse tipo de filme`); anyStrongCrossUser=true; }
+      if(v.score<=4 && aff>0.35 && down.length<4){ down.push(`${other} deu nota baixa (${v.score}) e o gosto de vocês costuma combinar`); anyStrongCrossUser=true; }
     }
   });
+
   const criticVals = [movie.ratings.imdb, movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
-  if(criticVals.length && reasons.length<4){
+  if(criticVals.length){
     const avg = criticVals.reduce((a,b)=>a+b,0)/criticVals.length;
-    if(avg>=7.5) reasons.push(`Bem avaliado pela crítica/público em geral (${avg.toFixed(1)}/10)`);
+    if(avg>=7.5 && up.length<4) up.push(`Bem avaliado pela crítica/público em geral (${avg.toFixed(1)}/10)`);
+    if(avg<6 && down.length<4) down.push(`Nota da crítica/público é só mediana (${avg.toFixed(1)}/10)`);
+  } else if(down.length<4){
+    down.push('Não há nota de crítica disponível pra usar como referência extra');
   }
-  return reasons.slice(0,4);
+
+  const { corr } = backtestAccuracy(person);
+  if(corr < 0.25 && down.length<4){
+    down.push('O algoritmo ainda não tem muita certeza dos padrões do seu gosto — precisa de mais avaliações suas pra ganhar confiança');
+  }
+  if(count < 15 && down.length<4){
+    down.push(`Você avaliou ${count} filme(s) até agora — a % fica mais assertiva conforme você avalia mais`);
+  }
+  if(up.length===0 && down.length===0){
+    down.push('Não encontrei padrões fortes o suficiente pra puxar a % pra cima ou pra baixo com confiança');
+  }
+
+  return { up: up.slice(0,4), down: down.slice(0,4) };
 }
 
 function renderRecommendationsModal(){
@@ -1704,7 +1743,7 @@ function renderRecommendationsModal(){
       ` : `
         <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus votos, na crítica especializada e em quão parecido seu gosto é com o dos outros — não é garantia, é uma sugestão.</p>
         ${items.map(({m,pct})=>{
-          const reasons = explainRecommendation(m, state.me);
+          const { up, down } = explainRecommendation(m, state.me);
           return `
           <div class="ticket" style="margin:10px 0">
             <div style="display:contents" onclick="__closeRecommendations(); __openMovie('${m.id}')">
@@ -1714,7 +1753,7 @@ function renderRecommendationsModal(){
               <h4 onclick="__closeRecommendations(); __openMovie('${m.id}')">${escapeHtml(displayTitle(m))}</h4>
               <div class="ticket-meta">${(m.genres||[]).slice(0,3).join(', ')}</div>
               <div style="margin-top:6px;font-size:22px;font-family:'Bebas Neue';color:var(--gold)">${pct}% de afinidade</div>
-              ${reasons.length ? `<ul style="margin:6px 0 0;padding-left:16px;font-size:12px;color:var(--muted)">${reasons.map(r=>`<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
+              ${explanationHtml(up, down)}
               <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="__dismissRecommendation('${m.id}')">🚫 Não me interessa</button>
             </div>
           </div>`;
