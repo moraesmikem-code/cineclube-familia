@@ -2247,7 +2247,9 @@ async function __runImportQueue(){
       render();
       return;
     }
-    await new Promise(res=>setTimeout(res, 350));
+    if(!entry.existing){
+      await new Promise(res=>setTimeout(res, 350));
+    }
   }
   await applyImportDestinations(st.destinations, st.destMovieIds);
   st.step = 'done';
