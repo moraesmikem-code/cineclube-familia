@@ -202,7 +202,7 @@
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getFirestore, doc, getDoc, setDoc, collection, getDocs, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCT8ESebwZWZVWfk7CT1Xk3NlG3b92wqcI",
@@ -241,6 +241,26 @@ async function fbSet(key, value){
   const [docId, field] = mapping;
   await setDoc(doc(db,'cineclube',docId), { [field]: value }, { merge:true });
   return { ok:true };
+}
+
+async function fbGetAllMovies(){
+  const snap = await getDocs(collection(db,'movies-items'));
+  return snap.docs.map(d=>d.data());
+}
+async function fbSaveMovie(movie){
+  await setDoc(doc(db,'movies-items',movie.id), movie);
+}
+async function fbDeleteMovie(movieId){
+  await deleteDoc(doc(db,'movies-items',movieId));
+}
+async function fbSaveMoviesBatch(movies){
+  const chunkSize = 450; // limite do Firestore é 500 operações por lote
+  for(let i=0;i<movies.length;i+=chunkSize){
+    const chunk = movies.slice(i, i+chunkSize);
+    const batch = writeBatch(db);
+    chunk.forEach(m=> batch.set(doc(db,'movies-items',m.id), m));
+    await batch.commit();
+  }
 }
 
 (function(){
@@ -342,7 +362,6 @@ async function init(){
   const fam = await sGet('family-config', true);
   const key = await sGet('omdb-key', true);
   const tmdbKey = await sGet('tmdb-key', true);
-  const movies = await sGet('movies-v1', true);
   const watchlists = await sGet('watchlists-v1', true);
   const watching = await sGet('watching-v1', true);
   const noted = await sGet('noted-v1', true);
@@ -350,7 +369,27 @@ async function init(){
   state.family = fam ? JSON.parse(fam) : null;
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
-  state.movies = movies ? JSON.parse(movies) : [];
+
+  // Filmes agora vivem numa coleção (1 documento por filme, sem limite de 1MB no catálogo todo).
+  // Se a coleção ainda estiver vazia, tenta migrar do formato antigo (1 documento só com tudo).
+  let movies = [];
+  try{
+    movies = await fbGetAllMovies();
+  }catch(e){ console.error('erro ao carregar filmes', e); }
+  if(movies.length === 0){
+    try{
+      const legacyJson = await sGet('movies-v1', true);
+      if(legacyJson){
+        const legacyMovies = JSON.parse(legacyJson);
+        if(legacyMovies.length){
+          movies = legacyMovies;
+          await fbSaveMoviesBatch(movies); // migra pra coleção nova
+        }
+      }
+    }catch(e){ console.error('erro na migração', e); }
+  }
+  state.movies = movies;
+
   state.watchlists = watchlists ? JSON.parse(watchlists) : {};
   state.lists = {
     priorities: state.watchlists,
@@ -769,6 +808,11 @@ function renderMain(){
       <div class="search-box">
         <input type="text" placeholder="Buscar por título..." value="${escapeAttr(state.search)}" oninput="__setSearch(this.value)">
       </div>
+      <div class="hint" style="margin:2px 0 8px">
+        📚 <b style="color:var(--cream)">${state.movies.length}</b> obras no catálogo
+        · 🎬 <b style="color:var(--cream)">${state.movies.filter(m=>(m.type||'movie')!=='series').length}</b> filmes
+        · 📺 <b style="color:var(--cream)">${state.movies.filter(m=>m.type==='series').length}</b> séries
+      </div>
     </header>
 
     <div class="panel">
@@ -1056,7 +1100,7 @@ function renderAddModal(){
     movie.checkins = {};
     state.family.members.forEach(m => movie.checkins[m] = null);
     state.movies.push(movie);
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    await fbSaveMovie(movie);
     state.addFlow = null;
     render();
   };
@@ -1215,7 +1259,7 @@ function renderMovieModal(id){
     if(!movie) return;
     if(!movie.checkins) movie.checkins = {};
     movie.checkins[state.me] = movie.checkins[state.me] ? null : new Date().toISOString();
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    await fbSaveMovie(movie);
     render();
   };
   window.__toggleEditRatings = (id)=>{
@@ -1232,7 +1276,7 @@ function renderMovieModal(id){
     try{
       const fresh = await fetchOmdb(movie.imdbId);
       mergeFreshOmdbInto(movie, fresh);
-      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      await fbSaveMovie(movie);
       render();
     }catch(e){
       alert('Não consegui atualizar agora: ' + (e.message||'erro desconhecido'));
@@ -1245,7 +1289,7 @@ function renderMovieModal(id){
     const mc = document.getElementById('edit-mc').value;
     movie.ratings.rtCritics = rtc!=='' ? parseFloat(rtc) : null;
     movie.ratings.metacritic = mc!=='' ? parseFloat(mc) : null;
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    await fbSaveMovie(movie);
     state._editingRatings = null;
     render();
   };
@@ -1254,7 +1298,7 @@ function renderMovieModal(id){
     m.votes[state.me] = { liked: pendingLiked, score: score };
     if(!m.checkins) m.checkins = {};
     if(!m.checkins[state.me]) m.checkins[state.me] = new Date().toISOString();
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    await fbSaveMovie(m);
     render();
   };
   window.__deleteMovie = async (id)=>{
@@ -1263,7 +1307,7 @@ function renderMovieModal(id){
     if(movie){
       if(!movie.hiddenBy) movie.hiddenBy = [];
       if(!movie.hiddenBy.includes(state.me)) movie.hiddenBy.push(state.me);
-      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      await fbSaveMovie(movie);
     }
     state.modalMovie = null;
     render();
@@ -1351,6 +1395,8 @@ function renderSettingsModal(){
     });
     let merged = 0;
     const survivors = [];
+    const removedIds = [];
+    const changedMains = [];
     Object.values(byImdb).forEach(group=>{
       if(group.length===1){ survivors.push(group[0]); return; }
       const main = group[0];
@@ -1365,12 +1411,15 @@ function renderSettingsModal(){
             main.checkins[name] = dup.checkins[name];
           }
         });
+        removedIds.push(dup.id);
         merged++;
       }
+      changedMains.push(main);
       survivors.push(main);
     });
     state.movies = survivors;
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    if(changedMains.length) await fbSaveMoviesBatch(changedMains);
+    for(const id of removedIds){ try{ await fbDeleteMovie(id); }catch(e){ console.error('erro ao apagar duplicado', e); } }
     const msgEl = document.getElementById('dedupe-msg');
     msgEl.innerHTML = merged>0
       ? `<div class="msg-ok">${merged} duplicado(s) encontrados e fundidos — os votos foram preservados.</div>`
@@ -1390,15 +1439,14 @@ function renderSettingsModal(){
       try{
         const fresh = await fetchOmdb(movie.imdbId);
         mergeFreshOmdbInto(movie, fresh);
+        await fbSaveMovie(movie);
         updated++;
       }catch(e){
         errors++;
         if(/limit|429|quota/i.test(e.message||'')){ stopped = true; break; }
       }
-      if(i%10===0) await sSet('movies-v1', JSON.stringify(state.movies), true);
       await new Promise(res=>setTimeout(res, 350));
     }
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
     msgEl.innerHTML = stopped
       ? `<div class="msg-error">Parei em ${updated} atualizados — provavelmente bati o limite diário da OMDb. Tenta de novo amanhã pra continuar.</div>`
       : `<div class="msg-ok">Catálogo atualizado! ${updated} títulos, ${errors} erro(s).</div>`;
@@ -1475,9 +1523,9 @@ function renderListModal(listKey){
       </div>
       ${myMovies.length===0 ? `<p class="hint" style="padding:0 4px">Nada aqui ainda — abra um filme no catálogo e toque em "${cfg.addLabel}".</p>` :
         myMovies.map(m=>`
-          <div style="position:relative">
+          <div style="margin:14px 0">
             ${renderCard(m)}
-            <button class="btn btn-danger btn-sm" style="position:absolute;top:10px;right:10px" onclick="event.stopPropagation(); __removeFromList('${listKey}','${m.id}')">🗑️ Remover</button>
+            <button class="btn btn-danger btn-sm btn-block" style="margin-top:-8px;border-top-left-radius:0;border-top-right-radius:0" onclick="__removeFromList('${listKey}','${m.id}')">🗑️ Remover desta pasta</button>
           </div>`).join('')}
 
       ${cfg.hasPublic ? `
@@ -1885,7 +1933,7 @@ async function dismissMovieFor(person, movieId){
   if(movie){
     if(!movie.dismissedBy) movie.dismissedBy = [];
     if(!movie.dismissedBy.includes(person)) movie.dismissedBy.push(person);
-    await sSet('movies-v1', JSON.stringify(state.movies), true);
+    await fbSaveMovie(movie);
   }
   if(state.lists.watching[person]){
     state.lists.watching[person].items = state.lists.watching[person].items.filter(it=>it.movieId!==movieId);
@@ -2073,7 +2121,22 @@ function renderImportModal(){
   }
 }
 
-window.__openImport = ()=>{ state.importState = { step:'upload' }; state.importOpen = true; render(); };
+window.__openImport = ()=>{
+  let saved = null;
+  try{
+    const raw = localStorage.getItem('cineclube-import-progress');
+    if(raw) saved = JSON.parse(raw);
+  }catch(e){}
+  if(saved && saved.queue && saved.processed < saved.queue.length){
+    state.importState = saved;
+    state.importState.paused = true;
+    state.importState.step = 'paused';
+  } else {
+    state.importState = { step:'upload' };
+  }
+  state.importOpen = true;
+  render();
+};
 window.__toggleImportDest = (key)=>{
   state.importState.destinations[key] = !state.importState.destinations[key];
   render();
@@ -2105,6 +2168,15 @@ async function applyImportDestinations(destinations, movieIds){
   }
 }
 
+function persistImportProgress(){
+  try{
+    localStorage.setItem('cineclube-import-progress', JSON.stringify(state.importState));
+  }catch(e){ /* se não der, só não retoma automaticamente depois */ }
+}
+function clearImportProgress(){
+  try{ localStorage.removeItem('cineclube-import-progress'); }catch(e){}
+}
+
 async function __runImportQueue(){
   const st = state.importState;
   st.step = 'running';
@@ -2117,7 +2189,10 @@ async function __runImportQueue(){
       if(entry.existing){
         await __applyExistingRating(entry);
         const existingMovie = state.movies.find(m=>m.imdbId===entry.imdbId);
-        if(existingMovie) st.destMovieIds.push(existingMovie.id);
+        if(existingMovie){
+          st.destMovieIds.push(existingMovie.id);
+          await fbSaveMovie(existingMovie);
+        }
       } else {
         if(!state.apiKey){ st.errors++; }
         else {
@@ -2139,6 +2214,7 @@ async function __runImportQueue(){
           movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
           state.movies.push(movie);
           st.destMovieIds.push(movie.id);
+          await fbSaveMovie(movie);
           st.added++;
           st.omdbCallsToday = (st.omdbCallsToday||0) + 1;
         }
@@ -2149,33 +2225,33 @@ async function __runImportQueue(){
         st.dailyLimitHit = true;
         st.paused = true;
         st.step = 'paused';
-        await sSet('movies-v1', JSON.stringify(state.movies), true);
         await applyImportDestinations(st.destinations, st.destMovieIds);
         st.destMovieIds = [];
+        persistImportProgress();
         render();
         return;
       }
     }
     st.processed++;
     if(st.processed % 8 === 0){
-      await sSet('movies-v1', JSON.stringify(state.movies), true);
+      persistImportProgress();
       render();
     }
     if(!entry.existing && (st.omdbCallsToday||0) >= 950){
       st.dailyLimitHit = true;
       st.paused = true;
       st.step = 'paused';
-      await sSet('movies-v1', JSON.stringify(state.movies), true);
       await applyImportDestinations(st.destinations, st.destMovieIds);
       st.destMovieIds = [];
+      persistImportProgress();
       render();
       return;
     }
     await new Promise(res=>setTimeout(res, 350));
   }
-  await sSet('movies-v1', JSON.stringify(state.movies), true);
   await applyImportDestinations(st.destinations, st.destMovieIds);
   st.step = 'done';
+  clearImportProgress();
   render();
 }
 
@@ -2187,13 +2263,19 @@ window.__startImport = ()=>{
   state.importState.errors = 0;
   state.importState.paused = false;
   state.importState.omdbCallsToday = 0;
+  persistImportProgress();
   __runImportQueue();
 };
-window.__pauseImport = ()=>{ state.importState.paused = true; state.importState.step='paused'; render(); };
+window.__pauseImport = ()=>{
+  state.importState.paused = true;
+  state.importState.step='paused';
+  persistImportProgress();
+  render();
+};
 window.__resumeImport = ()=>{ state.importState.paused = false; state.importState.omdbCallsToday = 0; __runImportQueue(); };
 
 init();
 })();
 </script>
 </body>
-  </html>
+</html>
