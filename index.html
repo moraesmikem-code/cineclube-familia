@@ -437,9 +437,23 @@ function extractImdbId(url){
   return m ? m[0] : null;
 }
 
+async function fetchWithTimeout(url, ms=15000){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), ms);
+  try{
+    const res = await fetch(url, { signal: controller.signal });
+    return res;
+  }catch(e){
+    if(e.name === 'AbortError') throw new Error('Tempo esgotado ao buscar dados (conexão lenta ou instável).');
+    throw e;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
 async function fetchOmdb(imdbId){
   const url = `https://www.omdbapi.com/?apikey=${encodeURIComponent(state.apiKey)}&i=${imdbId}&plot=full`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   if(data.Response === 'False'){
     throw new Error(data.Error || 'Filme não encontrado.');
@@ -485,7 +499,7 @@ async function fetchOmdb(imdbId){
 
 async function fetchTmdbLang(imdbId, lang, mediaType){
   const url = `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&external_source=imdb_id&language=${lang}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   if(mediaType === 'series'){
     if(data.tv_results && data.tv_results.length){
@@ -503,7 +517,7 @@ async function fetchTmdbLang(imdbId, lang, mediaType){
 
 async function fetchTmdbId(imdbId, mediaType){
   const url = `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&external_source=imdb_id`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   const result = mediaType==='series' ? (data.tv_results||[])[0] : (data.movie_results||[])[0];
   return result ? result.id : null;
@@ -514,7 +528,7 @@ async function fetchTmdbIdByTitle(title, year, mediaType){
   const searchType = mediaType==='series' ? 'tv' : 'movie';
   const yearParam = mediaType==='series' ? 'first_air_date_year' : 'year';
   const url = `https://api.themoviedb.org/3/search/${searchType}?api_key=${encodeURIComponent(state.tmdbKey)}&query=${encodeURIComponent(title)}${year?`&${yearParam}=${encodeURIComponent(year)}`:''}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   const results = data.results || [];
   if(!results.length) return null;
@@ -529,7 +543,7 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
   if(!tmdbId) return null;
   if(mediaType === 'series'){
     const url = `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=watch/providers`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url);
     const data = await res.json();
     const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
     const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
@@ -542,7 +556,7 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
     };
   }
   const url = `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=release_dates,watch/providers`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
   const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
@@ -557,7 +571,7 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
 
 async function fetchTmdbSeasonEpisodes(tmdbId, seasonNumber){
   const url = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${seasonNumber}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url);
   const data = await res.json();
   return (data.episodes||[]).map(e=>({ number:e.episode_number, name:e.name, airDate:e.air_date, overview:e.overview }));
 }
@@ -566,7 +580,7 @@ async function translateToPt(text){
   if(!text) return { text:'', ok:false };
   try{
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=pt&dt=t&q=${encodeURIComponent(text)}`;
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url);
     const data = await res.json();
     const translated = data[0].map(chunk => chunk[0]).join('');
     return { text: translated, ok:true };
