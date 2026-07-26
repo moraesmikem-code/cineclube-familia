@@ -193,6 +193,9 @@
   .msg-error{background:rgba(184,76,63,0.15);border:1px solid var(--dislike);color:#F3B3AA;padding:10px 12px;border-radius:10px;font-size:13px;margin:10px 0;}
   .msg-ok{background:rgba(76,154,106,0.15);border:1px solid var(--like);color:#BFE7CE;padding:10px 12px;border-radius:10px;font-size:13px;margin:10px 0;}
   .hint{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.4;}
+  .release-alert{background:rgba(212,167,44,0.15);border:1px solid var(--gold-dim);color:var(--gold);border-radius:8px;padding:8px 10px;font-size:12.5px;font-weight:600;margin-bottom:8px;}
+  .streaming-row{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;}
+  .streaming-row img{width:40px;height:40px;border-radius:9px;object-fit:cover;}
   .settings-link{text-align:center;margin:18px 0 6px;}
   .settings-link a{font-size:12px;color:var(--muted);text-decoration:underline;cursor:pointer;}
 </style>
@@ -220,6 +223,7 @@ const KEY_MAP = {
   'family-config': ['config','family'],
   'omdb-key':      ['config','omdbKey'],
   'tmdb-key':       ['config','tmdbKey'],
+  'last-general-update': ['config','lastGeneralUpdateAt'],
   'movies-v1':      ['movies','json'],
   'watchlists-v1':  ['watchlists','json'],
   'watching-v1':    ['watching','json'],
@@ -316,6 +320,30 @@ function altTitlesLine(m){
   return parts.join(' · ');
 }
 function displaySynopsis(m){ return m.synopsisPt || m.plot || ''; }
+function renderReleaseAlert(m){
+  const today = new Date().toISOString().slice(0,10);
+  if(m.type==='series' && m.nextEpisode && m.nextEpisode.airDate){
+    const future = m.nextEpisode.airDate >= today;
+    return `<div class="release-alert">📅 ${future?'Próximo episódio':'Último episódio lançado'}: T${m.nextEpisode.season}E${m.nextEpisode.episode} — ${new Date(m.nextEpisode.airDate+'T00:00').toLocaleDateString('pt-BR')}</div>`;
+  }
+  if(m.type==='series' && m.seasons && m.seasons.length){
+    const upcoming = m.seasons.filter(s=>s.airDate && s.airDate>=today).sort((a,b)=>a.airDate<b.airDate?-1:1)[0];
+    if(upcoming){
+      return `<div class="release-alert">📅 Próxima temporada (T${upcoming.number}): ${new Date(upcoming.airDate+'T00:00').toLocaleDateString('pt-BR')}</div>`;
+    }
+  }
+  if(m.type!=='series' && m.theatricalBR){
+    const future = m.theatricalBR >= today;
+    return `<div class="release-alert">🎬 ${future?'Estreia nos cinemas do Brasil':'Estreou nos cinemas do Brasil'}: ${new Date(m.theatricalBR+'T00:00').toLocaleDateString('pt-BR')}</div>`;
+  }
+  return '';
+}
+function renderStreamingLogos(m){
+  if(!m.streaming || !m.streaming.length) return m.lastUpdatedAt ? `<p class="hint" style="margin:6px 0 0">Não encontrado em nenhum streaming por assinatura no Brasil no momento.</p>` : '';
+  return `<div class="streaming-row">
+    ${m.streaming.map(s=>`<img src="https://image.tmdb.org/t/p/w92${s.logo}" title="${escapeHtml(s.name)}" alt="${escapeHtml(s.name)}">`).join('')}
+  </div>`;
+}
 function getListData(listKey, person){
   return (state.lists && state.lists[listKey] && state.lists[listKey][person]) || { public: LIST_TYPES[listKey].hasPublic, items: [] };
 }
@@ -362,6 +390,7 @@ async function init(){
   const fam = await sGet('family-config', true);
   const key = await sGet('omdb-key', true);
   const tmdbKey = await sGet('tmdb-key', true);
+  const lastGeneralUpdate = await sGet('last-general-update', true);
   const watchlists = await sGet('watchlists-v1', true);
   const watching = await sGet('watching-v1', true);
   const noted = await sGet('noted-v1', true);
@@ -369,6 +398,7 @@ async function init(){
   state.family = fam ? JSON.parse(fam) : null;
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
+  state.lastGeneralUpdateAt = lastGeneralUpdate || null;
 
   // Filmes agora vivem numa coleção (1 documento por filme, sem limite de 1MB no catálogo todo).
   // Se a coleção ainda estiver vazia, tenta migrar do formato antigo (1 documento só com tudo).
@@ -469,6 +499,52 @@ async function fetchTmdbLang(imdbId, lang, mediaType){
     return { title: r.title, original_title: r.original_title, overview: r.overview };
   }
   return null;
+}
+
+async function fetchTmdbId(imdbId, mediaType){
+  const url = `https://api.themoviedb.org/3/find/${imdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&external_source=imdb_id`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const result = mediaType==='series' ? (data.tv_results||[])[0] : (data.movie_results||[])[0];
+  return result ? result.id : null;
+}
+
+async function fetchTmdbDetails(imdbId, mediaType){
+  const tmdbId = await fetchTmdbId(imdbId, mediaType);
+  if(!tmdbId) return null;
+  if(mediaType === 'series'){
+    const url = `https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=watch/providers`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
+    const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
+    return {
+      tmdbId,
+      status: data.status || null,
+      nextEpisode: data.next_episode_to_air ? { season:data.next_episode_to_air.season_number, episode:data.next_episode_to_air.episode_number, airDate:data.next_episode_to_air.air_date } : null,
+      seasons: (data.seasons||[]).filter(s=>s.season_number>0).map(s=>({ number:s.season_number, episodeCount:s.episode_count, airDate:s.air_date, name:s.name })),
+      streaming
+    };
+  }
+  const url = `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=release_dates,watch/providers`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
+  const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
+  let theatricalBR = null;
+  const brBlock = (data.release_dates && data.release_dates.results || []).find(r=>r.iso_3166_1==='BR');
+  if(brBlock && brBlock.release_dates && brBlock.release_dates.length){
+    const theatrical = brBlock.release_dates.find(rd=>rd.type===3) || brBlock.release_dates[0];
+    if(theatrical && theatrical.release_date) theatricalBR = theatrical.release_date;
+  }
+  return { tmdbId, status: data.status || null, theatricalBR, streaming };
+}
+
+async function fetchTmdbSeasonEpisodes(tmdbId, seasonNumber){
+  const url = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${seasonNumber}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR`;
+  const res = await fetch(url);
+  const data = await res.json();
+  return (data.episodes||[]).map(e=>({ number:e.episode_number, name:e.name, airDate:e.air_date, overview:e.overview }));
 }
 
 async function translateToPt(text){
@@ -710,7 +786,7 @@ function catalogListHtml(list){
 
 /* ---------- RENDER ---------- */
 function removeOverlays(){
-  ['add-overlay','movie-overlay','settings-overlay','list-overlay','reco-overlay','import-overlay'].forEach(id=>{
+  ['add-overlay','movie-overlay','settings-overlay','list-overlay','reco-overlay','import-overlay','episodes-overlay'].forEach(id=>{
     const el = document.getElementById(id);
     if(el) el.remove();
   });
@@ -728,6 +804,7 @@ function render(){
   if(state.listOpen) renderListModal(state.listOpen);
   if(state.recommendationsOpen) renderRecommendationsModal();
   if(state.importOpen) renderImportModal();
+  if(state.episodeTrackerId) renderEpisodeTrackerModal(state.episodeTrackerId);
 }
 
 function renderFamilySetup(){
@@ -967,6 +1044,7 @@ function renderCard(m){
       ${altTitlesLine(m) ? `<div style="font-size:11px;color:var(--muted);margin-bottom:4px">${escapeHtml(altTitlesLine(m))}</div>` : ''}
       <div class="ticket-meta">${m.type==='series'?'📺 Série · ':''}${m.runtimeMin?m.runtimeMin+' min · ':''}${m.releaseDate?new Date(m.releaseDate).toLocaleDateString('pt-BR'):''}</div>
       <div class="genre-tags">${genres.map(g=>`<span>${g}</span>`).join('')}</div>
+      ${renderReleaseAlert(m)}
       <div class="ratings-row">
         ${ratingChip('IMDb', m.ratings.imdb)}
         ${ratingChip('RT', m.ratings.rtCritics)}
@@ -1144,7 +1222,17 @@ function renderMovieModal(id){
       <div class="ratings-row" style="font-size:13px">
         ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings.metacritic)}
         <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar notas</button>
-        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar dados externos</button>
+        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar notas (RT/Metacritic)</button>
+      </div>
+
+      <div class="panel" style="margin:12px 0">
+        <h3 style="font-size:16px">📡 Novidades e Streaming</h3>
+        ${renderReleaseAlert(m)}
+        ${renderStreamingLogos(m)}
+        <p class="hint" style="margin:6px 0 0">Esse botão verifica: nova data de estreia (cinema no Brasil ou streaming mundial), novas temporadas/episódios (se for série), e em quais streamings está disponível no Brasil agora.</p>
+        <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__refreshDetailedData('${m.id}')">🔄 Verificar novidades</button>
+        <div class="hint" style="margin-top:6px">${m.lastUpdatedAt ? 'Última atualização: '+new Date(m.lastUpdatedAt).toLocaleString('pt-BR') : 'Ainda não verificado — toque no botão acima pra buscar.'}</div>
+        ${m.type==='series' && m.tmdbId ? `<button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__openEpisodeTracker('${m.id}')">📺 Ver e marcar episódios</button>` : ''}
       </div>
       ${(()=>{
         const myV = m.votes[state.me];
@@ -1282,6 +1370,35 @@ function renderMovieModal(id){
       alert('Não consegui atualizar agora: ' + (e.message||'erro desconhecido'));
     }
   };
+  window.__refreshDetailedData = async (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    if(!state.tmdbKey){
+      alert('Essa checagem usa a TMDB (estreias, streaming, temporadas). Configure a chave da TMDB em Configurações primeiro.');
+      return;
+    }
+    try{
+      const details = await fetchTmdbDetails(movie.imdbId, movie.type);
+      if(!details){
+        alert('Não encontrei esse título na TMDB pra checar novidades.');
+        return;
+      }
+      movie.tmdbId = details.tmdbId;
+      movie.streaming = details.streaming;
+      movie.releaseStatus = details.status;
+      if(movie.type==='series'){
+        movie.nextEpisode = details.nextEpisode;
+        movie.seasons = details.seasons;
+      } else {
+        movie.theatricalBR = details.theatricalBR;
+      }
+      movie.lastUpdatedAt = new Date().toISOString();
+      await fbSaveMovie(movie);
+      render();
+    }catch(e){
+      alert('Não consegui verificar agora: ' + (e.message||'erro desconhecido'));
+    }
+  };
   window.__saveExternalRatings = async (id)=>{
     const movie = state.movies.find(x=>x.id===id);
     if(!movie) return;
@@ -1356,7 +1473,9 @@ function renderSettingsModal(){
       <div id="copy-catalog-msg"></div>
       <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__dedupeCatalog()">🧹 Verificar e remover duplicados</button>
       <div id="dedupe-msg"></div>
-      <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__updateCatalogAll()">🔄 Atualizar catálogo (RT, Metacritic, votos IMDb...)</button>
+      <p class="hint" style="margin-top:10px">Esse botão verifica, filme por filme, notas (RT/Metacritic), país/idioma, e — se a chave TMDB estiver configurada — também estreias, streaming e novas temporadas/episódios. ⏳ Com um catálogo grande (centenas/milhares de títulos), pode levar bastante tempo — deixe a tela aberta.</p>
+      <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__updateCatalogAll()">🔄 Atualizar catálogo completo</button>
+      <div class="hint">${state.lastGeneralUpdateAt ? 'Última atualização geral: '+new Date(state.lastGeneralUpdateAt).toLocaleString('pt-BR') : 'Ainda não foi feita nenhuma atualização geral.'}</div>
       <div id="update-catalog-msg"></div>
 
       <div class="divider"></div>
@@ -1439,6 +1558,19 @@ function renderSettingsModal(){
       try{
         const fresh = await fetchOmdb(movie.imdbId);
         mergeFreshOmdbInto(movie, fresh);
+        if(state.tmdbKey){
+          try{
+            const details = await fetchTmdbDetails(movie.imdbId, movie.type);
+            if(details){
+              movie.tmdbId = details.tmdbId;
+              movie.streaming = details.streaming;
+              movie.releaseStatus = details.status;
+              if(movie.type==='series'){ movie.nextEpisode = details.nextEpisode; movie.seasons = details.seasons; }
+              else { movie.theatricalBR = details.theatricalBR; }
+              movie.lastUpdatedAt = new Date().toISOString();
+            }
+          }catch(e2){ /* TMDB falhou nesse título, segue o baile só com a OMDb */ }
+        }
         await fbSaveMovie(movie);
         updated++;
       }catch(e){
@@ -1446,6 +1578,10 @@ function renderSettingsModal(){
         if(/limit|429|quota/i.test(e.message||'')){ stopped = true; break; }
       }
       await new Promise(res=>setTimeout(res, 350));
+    }
+    if(!stopped){
+      state.lastGeneralUpdateAt = new Date().toISOString();
+      await sSet('last-general-update', state.lastGeneralUpdateAt, true);
     }
     msgEl.innerHTML = stopped
       ? `<div class="msg-error">Parei em ${updated} atualizados — provavelmente bati o limite diário da OMDb. Tenta de novo amanhã pra continuar.</div>`
@@ -2275,6 +2411,99 @@ window.__pauseImport = ()=>{
   render();
 };
 window.__resumeImport = ()=>{ state.importState.paused = false; state.importState.omdbCallsToday = 0; __runImportQueue(); };
+
+/* ---------- RASTREADOR DE EPISÓDIOS ---------- */
+window.__openEpisodeTracker = (movieId)=>{
+  state.episodeTrackerId = movieId;
+  state.episodeTrackerSeason = null;
+  render();
+};
+
+function episodeKey(season, ep){ return 'S'+season+'E'+ep; }
+
+function renderEpisodeTrackerModal(movieId){
+  const m = state.movies.find(x=>x.id===movieId);
+  if(!m){ state.episodeTrackerId=null; return; }
+  const seasons = m.seasons || [];
+  const openSeason = state.episodeTrackerSeason;
+  const episodes = (openSeason!=null && m.episodeData && m.episodeData[openSeason]) ? m.episodeData[openSeason] : null;
+
+  document.body.insertAdjacentHTML('beforeend', `
+  <div class="overlay" id="episodes-overlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><h2>📺 ${escapeHtml(displayTitle(m))}</h2><button class="close-x" onclick="__closeEpisodeTracker()">×</button></div>
+      <p class="hint">Marque episódios assistidos e avalie cada um individualmente. Dados de temporadas vêm da última vez que você tocou em "Verificar novidades".</p>
+      ${seasons.length===0 ? `<p class="hint">Nenhuma temporada carregada ainda — feche essa tela e toque em "🔄 Verificar novidades" no filme primeiro.</p>` : ''}
+      <div class="panel">
+        ${seasons.map(s=>`
+          <div class="chip ${openSeason===s.number?'active':''}" style="display:block;text-align:left;margin-bottom:6px" onclick="__toggleSeason(${s.number})">
+            Temporada ${s.number}${s.name && !/^Season|Temporada/i.test(s.name)?' — '+escapeHtml(s.name):''} · ${s.episodeCount} episódios ${s.airDate?'· '+new Date(s.airDate+'T00:00').toLocaleDateString('pt-BR'):''}
+          </div>
+        `).join('')}
+      </div>
+      ${openSeason!=null ? `
+        <div class="panel">
+          <h3 style="font-size:16px">Temporada ${openSeason}</h3>
+          ${!episodes ? `<div class="loading-spin"></div>` : episodes.map(ep=>{
+            const key = episodeKey(openSeason, ep.number);
+            const myEp = (m.episodeVotes && m.episodeVotes[state.me] && m.episodeVotes[state.me][key]) || { watched:false, liked:null };
+            return `
+            <div class="vote-line" style="flex-direction:column;align-items:stretch;gap:6px;padding:10px 0">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span><b>E${ep.number}</b> ${escapeHtml(ep.name||'')}</span>
+                <span class="hint" style="margin:0">${ep.airDate?new Date(ep.airDate+'T00:00').toLocaleDateString('pt-BR'):''}</span>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin:0">
+                  <input type="checkbox" style="width:auto" ${myEp.watched?'checked':''} onchange="__toggleEpisodeWatched('${key}')"> assistido
+                </label>
+                <button class="icon-btn" style="font-size:16px;${myEp.liked==='like'?'color:var(--like)':''}" onclick="__setEpisodeLike('${key}','like')">👍</button>
+                <button class="icon-btn" style="font-size:16px;${myEp.liked==='dislike'?'color:var(--dislike)':''}" onclick="__setEpisodeLike('${key}','dislike')">👎</button>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+      ` : ''}
+    </div>
+  </div>`);
+  document.getElementById('episodes-overlay').addEventListener('click',(e)=>{ if(e.target.id==='episodes-overlay') __closeEpisodeTracker(); });
+
+  window.__closeEpisodeTracker = ()=>{ state.episodeTrackerId=null; render(); };
+  window.__toggleSeason = async (num)=>{
+    state.episodeTrackerSeason = (state.episodeTrackerSeason===num) ? null : num;
+    if(state.episodeTrackerSeason!=null){
+      if(!m.episodeData) m.episodeData = {};
+      if(!m.episodeData[num]){
+        render();
+        try{
+          const eps = await fetchTmdbSeasonEpisodes(m.tmdbId, num);
+          m.episodeData[num] = eps;
+          await fbSaveMovie(m);
+        }catch(e){ alert('Erro ao buscar episódios: '+e.message); }
+      }
+    }
+    render();
+  };
+  window.__toggleEpisodeWatched = async (key)=>{
+    if(!m.episodeVotes) m.episodeVotes = {};
+    if(!m.episodeVotes[state.me]) m.episodeVotes[state.me] = {};
+    const cur = m.episodeVotes[state.me][key] || { watched:false, liked:null };
+    cur.watched = !cur.watched;
+    m.episodeVotes[state.me][key] = cur;
+    await fbSaveMovie(m);
+    render();
+  };
+  window.__setEpisodeLike = async (key, val)=>{
+    if(!m.episodeVotes) m.episodeVotes = {};
+    if(!m.episodeVotes[state.me]) m.episodeVotes[state.me] = {};
+    const cur = m.episodeVotes[state.me][key] || { watched:false, liked:null };
+    cur.liked = (cur.liked===val) ? null : val;
+    m.episodeVotes[state.me][key] = cur;
+    await fbSaveMovie(m);
+    render();
+  };
+}
 
 init();
 })();
