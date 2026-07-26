@@ -1550,11 +1550,14 @@ function renderSettingsModal(){
       document.getElementById('update-catalog-msg').innerHTML = `<div class="msg-error">Configure a chave da OMDb primeiro.</div>`;
       return;
     }
+    state.catalogUpdateCancelled = false;
     const msgEl = document.getElementById('update-catalog-msg');
-    let updated = 0, errors = 0, stopped = false;
+    let updated = 0, errors = 0, stopped = false, cancelled = false;
     const failedTitles = [];
     for(let i=0;i<state.movies.length;i++){
-      msgEl.innerHTML = `<div class="hint">Atualizando ${i+1}/${state.movies.length}... (${updated} ok, ${errors} erro)</div>`;
+      if(state.catalogUpdateCancelled){ cancelled = true; break; }
+      msgEl.innerHTML = `<div class="hint">Atualizando ${i+1}/${state.movies.length}... (${updated} ok, ${errors} erro)</div>
+        <button class="btn btn-danger btn-sm" style="margin-top:6px" onclick="__cancelCatalogUpdate()">⏹ Parar atualização</button>`;
       const movie = state.movies[i];
       try{
         const fresh = await fetchOmdb(movie.imdbId);
@@ -1581,16 +1584,19 @@ function renderSettingsModal(){
       }
       await new Promise(res=>setTimeout(res, 350));
     }
-    if(!stopped){
+    if(!stopped && !cancelled){
       state.lastGeneralUpdateAt = new Date().toISOString();
       await sSet('last-general-update', state.lastGeneralUpdateAt, true);
     }
-    msgEl.innerHTML = (stopped
+    msgEl.innerHTML = (cancelled
+      ? `<div class="msg-error">Atualização interrompida por você em ${updated+errors} de ${state.movies.length} títulos. O que já foi atualizado está salvo.</div>`
+      : stopped
       ? `<div class="msg-error">Parei em ${updated} atualizados — provavelmente bati o limite diário da OMDb. Tenta de novo amanhã pra continuar.</div>`
       : `<div class="msg-ok">Catálogo atualizado! ${updated} títulos, ${errors} erro(s).</div>`)
       + (failedTitles.length ? `<div class="hint" style="margin-top:6px">Títulos com erro: ${failedTitles.map(escapeHtml).join(', ')}</div>` : '');
     render(); state.settingsOpen = true; render();
   };
+  window.__cancelCatalogUpdate = ()=>{ state.catalogUpdateCancelled = true; };
   window.__saveKey = async ()=>{
     const val = document.getElementById('api-key-input').value.trim();
     const res = await sSet('omdb-key', val, true);
