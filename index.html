@@ -1572,7 +1572,6 @@ function renderSettingsModal(){
     msgEl.innerHTML = merged>0
       ? `<div class="msg-ok">${merged} duplicado(s) encontrados e fundidos — os votos foram preservados.</div>`
       : `<div class="msg-ok">Nenhum duplicado encontrado. Catálogo já está limpo.</div>`;
-    render(); state.settingsOpen = true; render();
   };
   window.__updateCatalogAll = async ()=>{
     if(!state.apiKey){
@@ -1646,7 +1645,6 @@ function renderSettingsModal(){
       ? `<div class="msg-error">Parei — provavelmente bati o limite diário da OMDb. Progresso salvo, tenta de novo amanhã pra continuar de onde parou.</div>`
       : `<div class="msg-ok">Catálogo atualizado! ${updated} títulos, ${errors} erro(s).</div>`)
       + (failedTitles.length ? `<div class="hint" style="margin-top:6px">Títulos com erro: ${failedTitles.map(escapeHtml).join(', ')}</div>` : '');
-    render(); state.settingsOpen = true; render();
   };
   window.__cancelCatalogUpdate = ()=>{ state.catalogUpdateCancelled = true; };
   window.__saveKey = async ()=>{
