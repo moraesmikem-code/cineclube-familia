@@ -1896,7 +1896,9 @@ function rawTasteSignal(movie, maps){
   let raw = 0, maxPossible = 0.0001;
   function add(map, keys, weightMul){
     keys.forEach(k=>{
-      const eff = shrunkWeight(map[k]);
+      const entry = map[k];
+      if(!entry || entry.n===0) return; // sem nenhum dado sobre essa característica: não conta a favor nem contra
+      const eff = shrunkWeight(entry);
       raw += eff*weightMul;
       maxPossible += (Math.abs(eff)+1)*weightMul;
     });
