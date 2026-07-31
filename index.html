@@ -87,7 +87,8 @@
   }
 
   /* FILTER BAR */
-  .toolbar{display:flex;gap:8px;margin:10px 0 6px;flex-wrap:wrap;}
+  .toolbar{display:flex;gap:14px;margin:10px 0 10px;flex-wrap:wrap;}
+  .toolbar .btn{padding:12px 14px;}
   .toolbar .btn{flex:1 1 auto;min-width:0;}
   .search-box{position:relative;margin:10px 0;}
   .search-box input{padding-left:36px;}
@@ -224,6 +225,8 @@ const KEY_MAP = {
   'omdb-key':      ['config','omdbKey'],
   'tmdb-key':       ['config','tmdbKey'],
   'last-general-update': ['config','lastGeneralUpdateAt'],
+  'update-error-log': ['config','updateErrorLog'],
+  'import-error-log': ['config','importErrorLog'],
   'movies-v1':      ['movies','json'],
   'watchlists-v1':  ['watchlists','json'],
   'watching-v1':    ['watching','json'],
@@ -391,6 +394,8 @@ async function init(){
   const key = await sGet('omdb-key', true);
   const tmdbKey = await sGet('tmdb-key', true);
   const lastGeneralUpdate = await sGet('last-general-update', true);
+  const updateErrorLogRaw = await sGet('update-error-log', true);
+  const importErrorLogRaw = await sGet('import-error-log', true);
   const watchlists = await sGet('watchlists-v1', true);
   const watching = await sGet('watching-v1', true);
   const noted = await sGet('noted-v1', true);
@@ -399,6 +404,8 @@ async function init(){
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
   state.lastGeneralUpdateAt = lastGeneralUpdate || null;
+  try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
+  try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
 
   // Filmes agora vivem numa coleção (1 documento por filme, sem limite de 1MB no catálogo todo).
   // Se a coleção ainda estiver vazia, tenta migrar do formato antigo (1 documento só com tudo).
@@ -797,6 +804,10 @@ function sortMovieList(list, field, dir){
     const ka=keyOf(a), kb=keyOf(b);
     if(ka<kb) return -1*dirMul;
     if(ka>kb) return 1*dirMul;
+    if(field==='recommendation'){
+      const ia = a.ratings.imdb ?? -1, ib = b.ratings.imdb ?? -1;
+      if(ia!==ib) return (ia<ib) ? 1 : -1; // desempate: maior nota do IMDb primeiro, sempre
+    }
     return 0;
   });
   return out;
@@ -810,12 +821,24 @@ function catalogListHtml(list){
         <p>Toque no botão dourado para colar o link de um filme do IMDb e começar o catálogo da família.</p>
       </div>`;
   }
-  return list.map(renderCard).join('');
+  if(!state.catalogPageSize) state.catalogPageSize = 30;
+  const pageSize = state.catalogPageSize;
+  const visible = list.slice(0, pageSize);
+  let html = visible.map(renderCard).join('');
+  if(list.length > pageSize){
+    html += `<button class="btn btn-ghost btn-block" style="margin:10px 0" onclick="__loadMoreCatalog()">Carregar mais (${list.length - pageSize} restantes)</button>`;
+  }
+  return html;
 }
+window.__loadMoreCatalog = ()=>{
+  state.catalogPageSize = (state.catalogPageSize||30) + 30;
+  const el = document.getElementById('catalog');
+  if(el) el.innerHTML = catalogListHtml(getFilteredSorted());
+};
 
 /* ---------- RENDER ---------- */
 function removeOverlays(){
-  ['add-overlay','movie-overlay','settings-overlay','list-overlay','reco-overlay','import-overlay','episodes-overlay'].forEach(id=>{
+  ['add-overlay','movie-overlay','settings-overlay','list-overlay','import-overlay','episodes-overlay','errorlog-overlay'].forEach(id=>{
     const el = document.getElementById(id);
     if(el) el.remove();
   });
@@ -831,9 +854,9 @@ function render(){
   if(state.addFlow) renderAddModal();
   if(state.settingsOpen) renderSettingsModal();
   if(state.listOpen) renderListModal(state.listOpen);
-  if(state.recommendationsOpen) renderRecommendationsModal();
   if(state.importOpen) renderImportModal();
   if(state.episodeTrackerId) renderEpisodeTrackerModal(state.episodeTrackerId);
+  if(state.errorLogOpen) renderErrorLogModal();
 }
 
 function renderFamilySetup(){
@@ -908,7 +931,6 @@ function renderMain(){
         <button class="btn btn-ghost btn-sm" onclick="__openList('priorities')">📋 Prioridades</button>
         <button class="btn btn-ghost btn-sm" onclick="__openList('watching')">👀 Assistindo</button>
         <button class="btn btn-ghost btn-sm" onclick="__openList('noted')">📝 Anotados</button>
-        <button class="btn btn-ghost btn-sm" onclick="__openRecommendations()">✨ Recomendados</button>
       </div>
       <div class="hint" style="margin:-4px 0 8px">Quanto mais filmes e séries você avaliar com suas notas, maior a chance do algoritmo acertar nas recomendações.</div>
       <div class="search-box">
@@ -1038,7 +1060,6 @@ function renderMain(){
   window.__openAdd = ()=>{ state.addFlow = {step:'input', url:'', error:null, loading:false, data:null}; render(); };
   window.__openSettings = ()=>{ state.settingsOpen = true; render(); };
   window.__openList = (listKey)=>{ state.listOpen = listKey; render(); };
-  window.__openRecommendations = ()=>{ state.recommendationsOpen = true; render(); };
   window.__openMovie = (id)=>{ state.modalMovie = id; render(); };
 }
 
@@ -1506,6 +1527,7 @@ function renderSettingsModal(){
       <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__updateCatalogAll()">🔄 Atualizar catálogo completo</button>
       <div class="hint">${state.lastGeneralUpdateAt ? 'Última atualização geral: '+new Date(state.lastGeneralUpdateAt).toLocaleString('pt-BR') : 'Ainda não foi feita nenhuma atualização geral.'}</div>
       <div id="update-catalog-msg"></div>
+      <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__closeSettings(); __openErrorLog();">🕘 Ver histórico de erros ${((state.updateErrorLog?state.updateErrorLog.length:0)+(state.importErrorLog?state.importErrorLog.length:0))>0 ? '('+((state.updateErrorLog?state.updateErrorLog.length:0)+(state.importErrorLog?state.importErrorLog.length:0))+')' : ''}</button>
 
       <div class="divider"></div>
       <label style="margin-top:0">Membros da família</label>
@@ -1623,7 +1645,7 @@ function renderSettingsModal(){
           updated++;
         }catch(e){
           errors++;
-          failedTitles.push(displayTitle(movie));
+          failedTitles.push({ title: displayTitle(movie), year: movie.year, imdbId: movie.imdbId });
           if(/limit|429|quota/i.test(e.message||'')){ stopped = true; break; }
         }
         processedIds.add(movie.id);
@@ -1639,12 +1661,18 @@ function renderSettingsModal(){
       await sSet('last-general-update', state.lastGeneralUpdateAt, true);
       try{ localStorage.removeItem('cineclube-catalog-update-progress'); }catch(e){}
     }
+    if(failedTitles.length){
+      if(!state.updateErrorLog) state.updateErrorLog = [];
+      state.updateErrorLog.unshift({ at: new Date().toISOString(), titles: failedTitles });
+      state.updateErrorLog = state.updateErrorLog.slice(0,10);
+      await sSet('update-error-log', JSON.stringify(state.updateErrorLog), true);
+    }
     msgEl.innerHTML = (cancelled
       ? `<div class="msg-error">Atualização interrompida por você. Progresso salvo — toque em "Atualizar catálogo completo" de novo pra continuar.</div>`
       : stopped
       ? `<div class="msg-error">Parei — provavelmente bati o limite diário da OMDb. Progresso salvo, tenta de novo amanhã pra continuar de onde parou.</div>`
       : `<div class="msg-ok">Catálogo atualizado! ${updated} títulos, ${errors} erro(s).</div>`)
-      + (failedTitles.length ? `<div class="hint" style="margin-top:6px">Títulos com erro: ${failedTitles.map(escapeHtml).join(', ')}</div>` : '');
+      + (failedTitles.length ? `<div class="hint" style="margin-top:6px">Títulos com erro: ${failedTitles.map(t=>escapeHtml(t.title+(t.year?' ('+t.year+')':''))).join(', ')} — veja também em "🕘 Ver erros das últimas atualizações".</div>` : '');
   };
   window.__cancelCatalogUpdate = ()=>{ state.catalogUpdateCancelled = true; };
   window.__saveKey = async ()=>{
@@ -1770,7 +1798,31 @@ function runtimeBucket(min){
   return 'muito longo (150min+)';
 }
 
+let _profileCache = {};
 function buildTasteProfile(person, excludeId){
+  let ratedCount = 0;
+  state.movies.forEach(m=>{
+    const v = m.votes[person];
+    if((v && v.score!=null) || (m.dismissedBy && m.dismissedBy.includes(person))) ratedCount++;
+  });
+  const cacheKey = person + ':' + ratedCount;
+  if(!_profileCache[cacheKey]){
+    _profileCache = {}; // troca de pessoa/contagem: descarta cache antigo (evita crescer sem limite)
+    _profileCache[cacheKey] = buildTasteProfileRaw(person, null);
+  }
+  const base = _profileCache[cacheKey];
+  if(excludeId==null) return base;
+  // só refaz do zero (mais caro) se o filme excluído realmente participa do perfil dessa pessoa
+  const excludedMovie = state.movies.find(m=>m.id===excludeId);
+  const participates = excludedMovie && (
+    (excludedMovie.votes[person] && excludedMovie.votes[person].score!=null) ||
+    (excludedMovie.dismissedBy && excludedMovie.dismissedBy.includes(person))
+  );
+  if(!participates) return base;
+  return buildTasteProfileRaw(person, excludeId);
+}
+
+function buildTasteProfileRaw(person, excludeId){
   const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{}, runtime:{} };
   let count = 0;
   function bump(map, key, w){
@@ -1808,20 +1860,29 @@ function buildTasteProfile(person, excludeId){
   return { maps, count };
 }
 
+let _crossAffinityCache = {};
 function crossUserAffinity(personA, personB){
+  const cacheKey = personA+'|'+personB+':'+state.movies.length;
+  if(_crossAffinityCache[cacheKey]!==undefined) return _crossAffinityCache[cacheKey];
   const common = state.movies.filter(m=>{
     const a=m.votes[personA], b=m.votes[personB];
     return a && a.score!=null && b && b.score!=null;
   });
-  if(common.length < 3) return 0; // exige mais filmes em comum antes de confiar na afinidade
-  let sum=0;
-  common.forEach(m=>{
-    const diff = Math.abs(m.votes[personA].score - m.votes[personB].score);
-    sum += (1 - diff/9);
-  });
-  const raw = (sum/common.length)*2 - 1; // -1..1
-  const confidence = Math.min(1, common.length/8); // precisa de ~8 filmes em comum pra confiança máxima
-  return raw * confidence;
+  let result;
+  if(common.length < 3){ result = 0; } // exige mais filmes em comum antes de confiar na afinidade
+  else {
+    let sum=0;
+    common.forEach(m=>{
+      const diff = Math.abs(m.votes[personA].score - m.votes[personB].score);
+      sum += (1 - diff/9);
+    });
+    const raw = (sum/common.length)*2 - 1; // -1..1
+    const confidence = Math.min(1, common.length/8); // precisa de ~8 filmes em comum pra confiança máxima
+    result = raw * confidence;
+  }
+  if(Object.keys(_crossAffinityCache).length > 200) _crossAffinityCache = {};
+  _crossAffinityCache[cacheKey] = result;
+  return result;
 }
 
 // Afinidade entre duas pessoas, mas específica pro contexto do filme (gênero, década, país) —
@@ -1885,7 +1946,9 @@ function rawTasteSignal(movie, maps){
   let raw = 0, maxPossible = 0.0001;
   function add(map, keys, weightMul){
     keys.forEach(k=>{
-      const eff = shrunkWeight(map[k]);
+      const entry = map[k];
+      if(!entry || entry.n===0) return; // sem nenhum dado sobre essa característica: não conta a favor nem contra
+      const eff = shrunkWeight(entry);
       raw += eff*weightMul;
       maxPossible += (Math.abs(eff)+1)*weightMul;
     });
@@ -2021,7 +2084,7 @@ function estimateAffinity(movie, person){
   const overallConfidence = Math.min(1, count/15);
   const deviation = (raw/maxPossible) * 50 * overallConfidence * reliability;
   const pct = Math.max(5, Math.min(95, Math.round(50 + deviation)));
-  return { ready:true, pct };
+  return { ready:true, pct, _debug: { raw: raw.toFixed(2), maxPossible: maxPossible.toFixed(2), ratio:(raw/maxPossible).toFixed(3), corr: corr.toFixed(2), count } };
 }
 
 function computeRecommendations(){
@@ -2119,8 +2182,10 @@ function explainRecommendation(movie, person){
   if(up.length===0 && down.length===0){
     down.push('Não encontrei padrões fortes o suficiente pra puxar a % pra cima ou pra baixo com confiança');
   }
+  const { raw, maxPossible } = rawTasteSignal(movie, maps);
+  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} maxPossible=${maxPossible.toFixed(2)} razão=${(raw/maxPossible).toFixed(3)} confiabilidade(corr)=${corr.toFixed(2)} conf.geral=${overallConfidence.toFixed(2)} filmesAvaliados=${count}`);
 
-  return { up: up.slice(0,4), down: down.slice(0,5) };
+  return { up: up.slice(0,4), down: down.slice(0,8) };
 }
 
 async function dismissMovieFor(person, movieId){
@@ -2134,51 +2199,6 @@ async function dismissMovieFor(person, movieId){
     state.lists.watching[person].items = state.lists.watching[person].items.filter(it=>it.movieId!==movieId);
     await saveListData('watching');
   }
-}
-window.__dismissRecommendation = async (movieId)=>{
-  await dismissMovieFor(state.me, movieId);
-  render(); state.recommendationsOpen = true; render();
-};
-
-function renderRecommendationsModal(){
-  const { ready, items } = computeRecommendations();
-  document.body.insertAdjacentHTML('beforeend', `
-  <div class="overlay" id="reco-overlay">
-    <div class="modal">
-      <div class="modal-handle"></div>
-      <div class="modal-header"><h2>✨ Recomendados</h2><button class="close-x" onclick="__closeRecommendations()">×</button></div>
-      ${!ready ? `
-        <p style="color:var(--muted);font-size:13.5px;line-height:1.5">
-          Dê nota a pelo menos 6 filmes para eu conseguir estimar o que combina com o seu gosto.
-          Isso não é uma IA de verdade prevendo o futuro — é um cálculo comparando gêneros, diretores, atores,
-          roteiristas, país, década, produtora e o quanto seu gosto se parece com o dos outros da família,
-          além de conferir a nota da crítica como segurança extra. Quanto mais você avaliar, mais precisa fica a estimativa —
-          e o próprio algoritmo se testa contra suas notas reais pra saber se pode confiar em si mesmo.
-        </p>
-      ` : `
-        <p class="hint" style="margin-bottom:12px">Estimativa baseada nos seus votos, na crítica especializada e em quão parecido seu gosto é com o dos outros — não é garantia, é uma sugestão.</p>
-        ${items.map(({m,pct})=>{
-          const { up, down } = explainRecommendation(m, state.me);
-          return `
-          <div class="ticket" style="margin:10px 0">
-            <div style="display:contents" onclick="__closeRecommendations(); __openMovie('${m.id}')">
-              ${m.poster?`<img class="poster" src="${m.poster}">`:`<div class="poster-ph">🎬</div>`}
-            </div>
-            <div class="ticket-body">
-              <h4 onclick="__closeRecommendations(); __openMovie('${m.id}')">${escapeHtml(displayTitle(m))}</h4>
-              <div class="ticket-meta">${(m.genres||[]).slice(0,3).join(', ')}</div>
-              <div style="margin-top:6px;font-size:22px;font-family:'Bebas Neue';color:var(--gold)">${pct}% de afinidade</div>
-              ${explanationHtml(up, down)}
-              <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="__dismissRecommendation('${m.id}')">🚫 Não me interessa</button>
-            </div>
-          </div>`;
-        }).join('')}
-        ${items.length===0 ? `<p class="hint">Nenhum filme novo no catálogo pra recomendar ainda — adicione mais títulos.</p>` : ''}
-      `}
-    </div>
-  </div>`);
-  document.getElementById('reco-overlay').addEventListener('click',(e)=>{ if(e.target.id==='reco-overlay') __closeRecommendations(); });
-  window.__closeRecommendations = ()=>{ state.recommendationsOpen=false; render(); };
 }
 
 /* ---------- IMPORTAÇÃO EM MASSA DO IMDB ---------- */
@@ -2230,12 +2250,14 @@ function renderImportModal(){
     `;
   } else if(st.step === 'preview'){
     inner = `
-      <p style="font-size:14px">Encontrei <b style="color:var(--gold)">${st.total}</b> avaliações no arquivo.</p>
+      <p style="font-size:14px">Encontrei <b style="color:var(--gold)">${st.total}</b> títulos no arquivo.</p>
       <p style="font-size:13.5px;color:var(--muted)">
-        <b>${st.alreadyInCatalog}</b> já estão no catálogo (só vou aplicar sua nota, rápido).<br>
-        <b>${st.toFetch}</b> são novas e precisam ser buscadas na OMDb (uma de cada vez, com calma).
+        <b>${st.alreadyInCatalog}</b> já estão no catálogo.<br>
+        <b>${st.toFetch}</b> são novos e precisam ser buscados na OMDb (uma de cada vez, com calma).<br>
+        ${st.withRating ? `<b>${st.withRating}</b> têm nota sua (vão entrar com voto e check-in de assistido).<br>` : ''}
+        ${st.withoutRating ? `<b>${st.withoutRating}</b> não têm nota (ex: watchlist) — entram só no catálogo, sem nota nem check-in, a não ser que marque uma pasta abaixo.` : ''}
       </p>
-      <label style="margin-top:10px">Também adicionar tudo às pastas (opcional):</label>
+      <label style="margin-top:10px">Também adicionar tudo às pastas (opcional — recomendado se for uma watchlist, ex: marcar "Prioridades"):</label>
       <label style="display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer" onclick="__toggleImportDest('priorities')">
         <input type="checkbox" ${st.destinations.priorities?'checked':''} style="width:auto"> 📋 Prioridades
       </label>
@@ -2294,20 +2316,24 @@ function renderImportModal(){
         const text = await file.text();
         const rows = parseCSV(text);
         const idField = Object.keys(rows[0]||{}).find(k=>/const/i.test(k)) || 'Const';
-        const ratingField = Object.keys(rows[0]||{}).find(k=>/your rating/i.test(k)) || 'Your Rating';
-        const dateField = Object.keys(rows[0]||{}).find(k=>/date rated/i.test(k)) || 'Date Rated';
+        const ratingField = Object.keys(rows[0]||{}).find(k=>/your rating/i.test(k));
+        const dateField = Object.keys(rows[0]||{}).find(k=>/date rated|created/i.test(k));
         const existingIds = new Set(state.movies.map(m=>m.imdbId));
         const queue = [];
-        let already = 0;
+        let already = 0, withRating = 0, withoutRating = 0;
         rows.forEach(r=>{
           const imdbId = (r[idField]||'').trim();
-          const rating = parseInt(r[ratingField]);
-          if(!imdbId || isNaN(rating)) return;
+          if(!imdbId) return;
+          const rawRating = ratingField ? r[ratingField] : '';
+          const parsedRating = parseInt(rawRating);
+          const hasRating = rawRating!=null && rawRating!=='' && !isNaN(parsedRating);
           if(existingIds.has(imdbId)){ already++; }
-          queue.push({ imdbId, rating, dateRated: r[dateField]||null, existing: existingIds.has(imdbId) });
+          if(hasRating) withRating++; else withoutRating++;
+          queue.push({ imdbId, rating: hasRating ? parsedRating : null, dateRated: dateField ? (r[dateField]||null) : null, existing: existingIds.has(imdbId) });
         });
         state.importState = {
           step:'preview', total: queue.length, alreadyInCatalog: already, toFetch: queue.length-already,
+          withRating, withoutRating,
           rawQueue: queue, destinations: { priorities:false, watching:false, noted:false }
         };
         render();
@@ -2340,10 +2366,12 @@ window.__toggleImportDest = (key)=>{
 async function __applyExistingRating(entry){
   const movie = state.movies.find(m=>m.imdbId===entry.imdbId);
   if(!movie) return false;
-  if(!movie.votes) movie.votes = {};
-  movie.votes[state.me] = { liked: null, score: entry.rating };
-  if(!movie.checkins) movie.checkins = {};
-  if(!movie.checkins[state.me]) movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+  if(entry.rating!=null){
+    if(!movie.votes) movie.votes = {};
+    movie.votes[state.me] = { liked: null, score: entry.rating };
+    if(!movie.checkins) movie.checkins = {};
+    if(!movie.checkins[state.me]) movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+  }
   return true;
 }
 
@@ -2372,10 +2400,19 @@ function clearImportProgress(){
   try{ localStorage.removeItem('cineclube-import-progress'); }catch(e){}
 }
 
+async function saveImportErrorLog(entries){
+  if(!entries || !entries.length) return;
+  if(!state.importErrorLog) state.importErrorLog = [];
+  state.importErrorLog.unshift({ at: new Date().toISOString(), titles: entries.map(e=>({ title: null, year: null, imdbId: e.imdbId })) });
+  state.importErrorLog = state.importErrorLog.slice(0,10);
+  await sSet('import-error-log', JSON.stringify(state.importErrorLog), true);
+}
+
 async function __runImportQueue(){
   const st = state.importState;
   st.step = 'running';
   if(!st.destMovieIds) st.destMovieIds = [];
+  if(!st.failedEntries) st.failedEntries = [];
   render();
   while(st.processed < st.queue.length){
     if(st.paused) return;
@@ -2403,10 +2440,12 @@ async function __runImportQueue(){
             addedAt: new Date().toISOString(), addedBy: state.me, votes: {}, hiddenBy: [], dismissedBy: []
           };
           state.family.members.forEach(m => movie.votes[m] = {liked:null, score:null});
-          movie.votes[state.me] = { liked: null, score: entry.rating };
           movie.checkins = {};
           state.family.members.forEach(m => movie.checkins[m] = null);
-          movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+          if(entry.rating!=null){
+            movie.votes[state.me] = { liked: null, score: entry.rating };
+            movie.checkins[state.me] = entry.dateRated ? new Date(entry.dateRated).toISOString() : new Date().toISOString();
+          }
           state.movies.push(movie);
           st.destMovieIds.push(movie.id);
           await fbSaveMovie(movie);
@@ -2416,12 +2455,15 @@ async function __runImportQueue(){
       }
     }catch(e){
       st.errors++;
+      st.failedEntries.push({ imdbId: entry.imdbId });
       if(/limit|429|quota/i.test(e.message||'')){
         st.dailyLimitHit = true;
         st.paused = true;
         st.step = 'paused';
         await applyImportDestinations(st.destinations, st.destMovieIds);
         st.destMovieIds = [];
+        await saveImportErrorLog(st.failedEntries);
+        st.failedEntries = [];
         persistImportProgress();
         render();
         return;
@@ -2438,6 +2480,8 @@ async function __runImportQueue(){
       st.step = 'paused';
       await applyImportDestinations(st.destinations, st.destMovieIds);
       st.destMovieIds = [];
+      await saveImportErrorLog(st.failedEntries);
+      st.failedEntries = [];
       persistImportProgress();
       render();
       return;
@@ -2447,6 +2491,8 @@ async function __runImportQueue(){
     }
   }
   await applyImportDestinations(st.destinations, st.destMovieIds);
+  await saveImportErrorLog(st.failedEntries);
+  st.failedEntries = [];
   st.step = 'done';
   clearImportProgress();
   render();
@@ -2560,6 +2606,82 @@ function renderEpisodeTrackerModal(movieId){
     cur.liked = (cur.liked===val) ? null : val;
     m.episodeVotes[state.me][key] = cur;
     await fbSaveMovie(m);
+    render();
+  };
+}
+
+/* ---------- HISTÓRICO DE ERROS DE ATUALIZAÇÃO ---------- */
+window.__openErrorLog = ()=>{ state.errorLogOpen = true; render(); };
+
+function renderErrorRun(run, idx, logKey){
+  return `
+    <div class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3 style="font-size:15px;margin:0">${new Date(run.at).toLocaleString('pt-BR')} · ${run.titles.length} erro(s)</h3>
+        <button class="icon-btn" onclick="__deleteErrorRun('${logKey}',${idx})">🗑️</button>
+      </div>
+      ${run.titles.map((t,ti)=>`
+        <div class="vote-line">
+          <span>${t.title ? escapeHtml(t.title)+(t.year?` (${t.year})`:'') : escapeHtml(t.imdbId||'?')}</span>
+          <span style="display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" onclick="__retryFailedTitle('${t.imdbId}')">🔎 Tentar de novo</button>
+            <button class="icon-btn" onclick="__deleteErrorItem('${logKey}',${idx},${ti})">🗑️</button>
+          </span>
+        </div>
+      `).join('')}
+    </div>`;
+}
+
+function renderErrorLogModal(){
+  const updateLog = state.updateErrorLog || [];
+  const importLog = state.importErrorLog || [];
+  document.body.insertAdjacentHTML('beforeend', `
+  <div class="overlay" id="errorlog-overlay">
+    <div class="modal">
+      <div class="modal-handle"></div>
+      <div class="modal-header"><h2>🕘 Histórico de erros</h2><button class="close-x" onclick="__closeErrorLog()">×</button></div>
+
+      <h3 style="font-size:17px;color:var(--gold);margin-top:10px">Atualizações em lote</h3>
+      <p class="hint">Últimas ${Math.min(updateLog.length,10)} rodadas de "Atualizar catálogo completo" com erro.</p>
+      ${updateLog.length===0 ? `<p class="hint">Nenhum erro registrado.</p>` : updateLog.map((run,idx)=>renderErrorRun(run, idx, 'update')).join('')}
+      ${updateLog.length ? `<button class="btn btn-danger btn-block" style="margin-top:6px" onclick="__clearErrorLog('update')">🗑️ Limpar histórico de atualizações</button>` : ''}
+
+      <div class="divider"></div>
+
+      <h3 style="font-size:17px;color:var(--gold)">Importações do IMDb</h3>
+      <p class="hint">Últimas ${Math.min(importLog.length,10)} rodadas de importação com erro.</p>
+      ${importLog.length===0 ? `<p class="hint">Nenhum erro registrado.</p>` : importLog.map((run,idx)=>renderErrorRun(run, idx, 'import')).join('')}
+      ${importLog.length ? `<button class="btn btn-danger btn-block" style="margin-top:6px" onclick="__clearErrorLog('import')">🗑️ Limpar histórico de importações</button>` : ''}
+    </div>
+  </div>`);
+  document.getElementById('errorlog-overlay').addEventListener('click',(e)=>{ if(e.target.id==='errorlog-overlay') __closeErrorLog(); });
+
+  window.__closeErrorLog = ()=>{ state.errorLogOpen=false; render(); };
+  window.__clearErrorLog = async (logType)=>{
+    if(!confirm('Limpar todo esse histórico de erros?')) return;
+    const key = logType==='update' ? 'update-error-log' : 'import-error-log';
+    if(logType==='update') state.updateErrorLog = []; else state.importErrorLog = [];
+    await sSet(key, JSON.stringify([]), true);
+    render(); state.errorLogOpen = true; render();
+  };
+  window.__deleteErrorRun = async (logType, idx)=>{
+    const key = logType==='update' ? 'update-error-log' : 'import-error-log';
+    const arr = logType==='update' ? state.updateErrorLog : state.importErrorLog;
+    arr.splice(idx,1);
+    await sSet(key, JSON.stringify(arr), true);
+    render(); state.errorLogOpen = true; render();
+  };
+  window.__deleteErrorItem = async (logType, runIdx, itemIdx)=>{
+    const key = logType==='update' ? 'update-error-log' : 'import-error-log';
+    const arr = logType==='update' ? state.updateErrorLog : state.importErrorLog;
+    arr[runIdx].titles.splice(itemIdx,1);
+    if(arr[runIdx].titles.length===0) arr.splice(runIdx,1);
+    await sSet(key, JSON.stringify(arr), true);
+    render(); state.errorLogOpen = true; render();
+  };
+  window.__retryFailedTitle = (imdbId)=>{
+    state.errorLogOpen = false;
+    state.addFlow = { step:'input', url:`https://www.imdb.com/title/${imdbId}/`, error:null, loading:false, data:null };
     render();
   };
 }
