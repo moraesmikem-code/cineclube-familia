@@ -336,8 +336,12 @@ function renderReleaseAlert(m){
     }
   }
   if(m.type!=='series' && m.theatricalBR){
-    const future = m.theatricalBR >= today;
-    return `<div class="release-alert">🎬 ${future?'Estreia nos cinemas do Brasil':'Estreou nos cinemas do Brasil'}: ${new Date(m.theatricalBR+'T00:00').toLocaleDateString('pt-BR')}</div>`;
+    const d = new Date(m.theatricalBR.includes('T') ? m.theatricalBR : m.theatricalBR+'T00:00');
+    if(!isNaN(d.getTime())){
+      const iso = d.toISOString().slice(0,10);
+      const future = iso >= today;
+      return `<div class="release-alert">🎬 ${future?'Estreia nos cinemas do Brasil':'Estreou nos cinemas do Brasil'}: ${d.toLocaleDateString('pt-BR')}</div>`;
+    }
   }
   return '';
 }
@@ -466,16 +470,39 @@ async function fetchOmdb(imdbId){
     throw new Error(data.Error || 'Filme não encontrado.');
   }
   let rtCritics = null;
+  let imdbFromRatings = null;
+  let metaFromRatings = null;
   if(Array.isArray(data.Ratings)){
-    const found = data.Ratings.find(r => r.Source === 'Rotten Tomatoes');
-    if(found){
-      const pct = parseInt(found.Value);
-      if(!isNaN(pct)) rtCritics = Math.round((pct/10)*10)/10;
-    }
+    data.Ratings.forEach(r=>{
+      const src = (r.Source || '').toLowerCase();
+      const val = String(r.Value || '');
+      if(src.includes('rotten')){
+        const pct = parseInt(val);
+        if(!isNaN(pct)) rtCritics = Math.round((pct/10)*10)/10;
+      } else if(src.includes('internet movie') || src === 'imdb'){
+        const m = val.match(/([\d.]+)/);
+        if(m) imdbFromRatings = parseFloat(m[1]);
+      } else if(src.includes('metacritic')){
+        const m = val.match(/([\d.]+)/);
+        if(m){
+          const n = parseFloat(m[1]);
+          metaFromRatings = n > 10 ? Math.round((n/10)*10)/10 : n;
+        }
+      }
+    });
   }
-  const imdbRating = (data.imdbRating && data.imdbRating !== 'N/A') ? parseFloat(data.imdbRating) : null;
-  const imdbVotes = (data.imdbVotes && data.imdbVotes !== 'N/A') ? parseInt(data.imdbVotes.replace(/,/g,'')) : null;
-  const metascore = (data.Metascore && data.Metascore !== 'N/A') ? Math.round((parseInt(data.Metascore)/10)*10)/10 : null;
+  let imdbRating = (data.imdbRating && data.imdbRating !== 'N/A') ? parseFloat(data.imdbRating) : null;
+  if(imdbRating == null || isNaN(imdbRating)) imdbRating = imdbFromRatings;
+  if(imdbRating != null && isNaN(imdbRating)) imdbRating = null;
+
+  let imdbVotes = null;
+  if(data.imdbVotes && data.imdbVotes !== 'N/A'){
+    imdbVotes = parseInt(String(data.imdbVotes).replace(/,/g,''));
+    if(isNaN(imdbVotes)) imdbVotes = null;
+  }
+  let metascore = (data.Metascore && data.Metascore !== 'N/A') ? Math.round((parseInt(data.Metascore)/10)*10)/10 : null;
+  if(metascore == null || isNaN(metascore)) metascore = metaFromRatings;
+  if(metascore != null && isNaN(metascore)) metascore = null;
   const runtimeMin = (data.Runtime && data.Runtime !== 'N/A') ? parseInt(data.Runtime) : null;
   let releaseDate = null;
   if(data.Released && data.Released !== 'N/A'){
@@ -1109,8 +1136,10 @@ function renderMain(){
 }
 
 function ratingChip(label, val, scale){
-  if(val==null) return `<span>${label}: <span style="color:var(--muted)">—</span></span>`;
-  return `<span>${label}: <b>${val.toFixed(1)}</b></span>`;
+  if(val==null || val==='' || (typeof val==='number' && isNaN(val))) return `<span>${label}: <span style="color:var(--muted)">—</span></span>`;
+  const n = typeof val === 'number' ? val : parseFloat(val);
+  if(isNaN(n)) return `<span>${label}: <span style="color:var(--muted)">—</span></span>`;
+  return `<span>${label}: <b>${n.toFixed(1)}</b></span>`;
 }
 
 function renderCard(m){
@@ -1141,9 +1170,9 @@ function renderCard(m){
       <div class="genre-tags">${genres.map(g=>`<span>${g}</span>`).join('')}</div>
       ${renderReleaseAlert(m)}
       <div class="ratings-row">
-        ${ratingChip('IMDb', m.ratings.imdb)}
-        ${ratingChip('RT', m.ratings.rtCritics)}
-        ${ratingChip('Metacritic', m.ratings.metacritic)}
+        ${ratingChip('IMDb', m.ratings && m.ratings.imdb)}
+        ${ratingChip('RT', m.ratings && m.ratings.rtCritics)}
+        ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
         ${(()=>{ const myV=m.votes[state.me]; if(myV && myV.score!=null) return ''; const r=estimateAffinity(m,state.me); return r.ready ? `<span>Recomendação: <b style="color:var(--gold)">${r.pct}%</b></span>` : ''; })()}
       </div>
       ${checkinHtml}
@@ -1281,13 +1310,20 @@ function renderAddModal(){
 
 /* ---------- MOVIE DETAIL / VOTE MODAL ---------- */
 function mergeFreshOmdbInto(movie, fresh){
-  movie.ratings.imdb = fresh.ratings.imdb ?? movie.ratings.imdb;
-  movie.ratings.imdbVotes = fresh.ratings.imdbVotes ?? movie.ratings.imdbVotes;
-  movie.ratings.rtCritics = fresh.ratings.rtCritics ?? movie.ratings.rtCritics;
-  movie.ratings.metacritic = fresh.ratings.metacritic ?? movie.ratings.metacritic;
+  if(!movie.ratings) movie.ratings = {};
+  if(!fresh.ratings) fresh.ratings = {};
+  // Atualiza sempre que a OMDb trouxer valor (não só quando o campo antigo era null)
+  if(fresh.ratings.imdb != null) movie.ratings.imdb = fresh.ratings.imdb;
+  if(fresh.ratings.imdbVotes != null) movie.ratings.imdbVotes = fresh.ratings.imdbVotes;
+  if(fresh.ratings.rtCritics != null) movie.ratings.rtCritics = fresh.ratings.rtCritics;
+  if(fresh.ratings.metacritic != null) movie.ratings.metacritic = fresh.ratings.metacritic;
   if(fresh.countries && fresh.countries.length) movie.countries = fresh.countries;
   if(fresh.languages && fresh.languages.length){ movie.languages = fresh.languages; movie.primaryLanguage = fresh.languages[0]; }
   if(fresh.production) movie.production = fresh.production;
+  if(fresh.director) movie.director = fresh.director;
+  if(fresh.actors) movie.actors = fresh.actors;
+  if(fresh.writer) movie.writer = fresh.writer;
+  if(fresh.runtimeMin) movie.runtimeMin = fresh.runtimeMin;
 }
 
 function renderMovieModal(id){
@@ -1315,9 +1351,9 @@ function renderMovieModal(id){
         <p><b>Lançamento:</b> ${m.releaseDate?new Date(m.releaseDate).toLocaleDateString('pt-BR'):'—'}</p>
       </div>
       <div class="ratings-row" style="font-size:13px">
-        ${ratingChip('IMDb', m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings.metacritic)}
+        ${ratingChip('IMDb', m.ratings && m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings && m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
         <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar notas</button>
-        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar notas (RT/Metacritic)</button>
+        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar notas (OMDb)</button>
       </div>
 
       <div class="panel" style="margin:12px 0">
@@ -1340,7 +1376,9 @@ function renderMovieModal(id){
       ${state._editingRatings===m.id ? `
       <div class="vote-editor">
         <h4>Editar notas externas</h4>
-        <label style="margin-top:0">RT — Críticos (0–10)</label>
+        <label style="margin-top:0">IMDb (0–10)</label>
+        <input type="number" step="0.1" min="0" max="10" id="edit-imdb" value="${m.ratings.imdb ?? ''}">
+        <label>RT — Críticos (0–10)</label>
         <input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings.rtCritics ?? ''}">
         <label>Metacritic (0–10)</label>
         <input type="number" step="0.1" min="0" max="10" id="edit-mc" value="${m.ratings.metacritic ?? ''}">
@@ -1458,10 +1496,22 @@ function renderMovieModal(id){
       alert('Configure a chave da OMDb em Configurações antes de atualizar.');
       return;
     }
+    if(!movie.imdbId){
+      alert('Este título não tem ID do IMDb salvo. Reimporte pelo link do IMDb.');
+      return;
+    }
     try{
       const fresh = await fetchOmdb(movie.imdbId);
       mergeFreshOmdbInto(movie, fresh);
       await fbSaveMovie(movie);
+      const r = movie.ratings || {};
+      const msg = [
+        'Notas atualizadas:',
+        'IMDb: ' + (r.imdb != null ? r.imdb : '—') + (r.imdbVotes != null ? ' ('+r.imdbVotes.toLocaleString('pt-BR')+' votos)' : ''),
+        'RT: ' + (r.rtCritics != null ? r.rtCritics : '—'),
+        'Metacritic: ' + (r.metacritic != null ? r.metacritic : '—')
+      ].join('\n');
+      alert(msg);
       render();
     }catch(e){
       alert('Não consegui atualizar agora: ' + (e.message||'erro desconhecido'));
@@ -1500,8 +1550,11 @@ function renderMovieModal(id){
   window.__saveExternalRatings = async (id)=>{
     const movie = state.movies.find(x=>x.id===id);
     if(!movie) return;
+    if(!movie.ratings) movie.ratings = {};
+    const imdb = document.getElementById('edit-imdb').value;
     const rtc = document.getElementById('edit-rtc').value;
     const mc = document.getElementById('edit-mc').value;
+    movie.ratings.imdb = imdb!=='' ? parseFloat(imdb) : null;
     movie.ratings.rtCritics = rtc!=='' ? parseFloat(rtc) : null;
     movie.ratings.metacritic = mc!=='' ? parseFloat(mc) : null;
     await fbSaveMovie(movie);
@@ -2211,11 +2264,30 @@ function estimateAffinity(movie, person){
   let qualityPct = 50;
   if (extScore != null && !hasExtPenaltyCountry) {
     qualityPct = 50 + (extScore - 6.5) * 8;
+    // Confiança da qualidade: sem IMDb ou com poucos votos, puxa para 50.
+    // Impede que um RT isolado (ex.: 9.7 sem IMDb) infle a recomendação.
+    let qualityConf = 1;
+    if (imdbVal == null) {
+      // Só RT/Meta, sem IMDb → confiança baixa
+      qualityConf = 0.25;
+    } else if (imdbVotes != null) {
+      // log10(50000)≈4.7 → confiança cheia; <1000 votos → confiança baixa
+      qualityConf = Math.min(1, Math.log10(imdbVotes + 1) / 4.7);
+      qualityConf = Math.max(0.20, qualityConf);
+    } else {
+      qualityConf = 0.45; // tem IMDb mas sem contagem de votos
+    }
+    qualityPct = 50 + (qualityPct - 50) * qualityConf;
   }
 
   // Quando o gosto tem pouca evidência, a qualidade externa manda mais.
   // Evidência cheia → 50/50; evidência zero → 20% gosto / 80% qualidade.
-  const tasteWeight = 0.20 + 0.30 * tasteEvidence;
+  // Mas se a qualidade também tem baixa confiança (sem IMDb), não deixa ela dominar.
+  let tasteWeight = 0.20 + 0.30 * tasteEvidence;
+  if (imdbVal == null) {
+    // Sem IMDb: não deixa quality dominar — mistura mais neutra
+    tasteWeight = Math.max(tasteWeight, 0.45);
+  }
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
   pctFinal = Math.max(0, Math.min(100, pctFinal));
