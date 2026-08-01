@@ -2119,24 +2119,47 @@ function estimateAffinity(movie, person){
   // (algumas pessoas concordam mais com o público do IMDb, outras com a crítica do Metacritic/RT)
   const align = aggregatorAlignment(person);
   const ratings = movie.ratings || {};
-  const criticVals = [ratings.rtCritics, ratings.metacritic].filter(v=>v!=null);
-  const criticAvg = criticVals.length ? criticVals.reduce((a,b)=>a+b,0)/criticVals.length : null;
   const imdbVal = ratings.imdb;
-  let extScore = null;
-  if(imdbVal!=null && criticAvg!=null){
-    let wImdb = Math.abs(align.imdbCorr), wCritic = Math.abs(align.criticCorr);
-    if(wImdb+wCritic < 0.2){ wImdb = 0.5; wCritic = 0.5; } // sem sinal claro: pesa igual
-    else { const t=wImdb+wCritic; wImdb/=t; wCritic/=t; }
-    extScore = imdbVal*wImdb + criticAvg*wCritic;
-  } else if(imdbVal!=null){ extScore = imdbVal; }
-  else if(criticAvg!=null){ extScore = criticAvg; }
-  // Nota: a qualidade externa (IMDb/RT/Meta) NÃO entra mais no raw de gosto.
-  // Ela é misturada depois, de forma direta e separada (qualityPct), para não ser
-  // diluída pelos sinais de ator/gênero. Países penalizados continuam sem bônus
-  // via a variável hasPenaltyCountry na etapa final.
-  const hasExtPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
-  // Para países penalizados, a qualityPct será forçada para neutro (50) mais abaixo.
+  const imdbVotes = ratings.imdbVotes;
+  const rtVal = ratings.rtCritics;
+  const metaVal = ratings.metacritic;
 
+  // Qualidade externa com pesos separados:
+  // IMDb tem o DOBRO do peso base do Metacritic.
+  // RT fica no meio. Volume de votos do IMDb ainda aumenta a confiança.
+  let extScore = null;
+  {
+    let sum = 0, wSum = 0;
+    // Metacritic peso base = 1 → IMDb peso base = 2
+    const META_W = 1.0;
+    const IMDB_BASE_W = META_W * 2; // dobro do Metacritic
+    const RT_W = 1.2;
+
+    if (imdbVal != null) {
+      // Volume de votos reforça o IMDb (sem deixar o piso abaixo de 2× Meta)
+      let imdbW = IMDB_BASE_W;
+      if (imdbVotes != null) {
+        imdbW = Math.min(4.0, IMDB_BASE_W + Math.log10(imdbVotes + 1) / 3);
+      }
+      sum += imdbVal * imdbW;
+      wSum += imdbW;
+    }
+    if (metaVal != null) {
+      let metaW = META_W;
+      // Se discordar forte do IMDb, reduz um pouco
+      if (imdbVal != null && Math.abs(imdbVal - metaVal) > 1.5) metaW *= 0.5;
+      sum += metaVal * metaW;
+      wSum += metaW;
+    }
+    if (rtVal != null) {
+      let rtW = RT_W;
+      if (imdbVal != null && Math.abs(imdbVal - rtVal) > 1.5) rtW *= 0.5;
+      sum += rtVal * rtW;
+      wSum += rtW;
+    }
+    if (wSum > 0) extScore = sum / wSum;
+  }
+  const hasExtPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
 
   state.family.members.forEach(other=>{
     if(other===person) return;
@@ -2149,28 +2172,33 @@ function estimateAffinity(movie, person){
     maxPossible += Math.abs(contribution) + 1;
   });
 
-  // auto-validação: se o modelo historicamente não bate com as notas reais dessa pessoa, ele se contém
   const { corr } = backtestAccuracy(person);
   const reliability = Math.max(0.15, corr);
 
-  // --- % baseada no gosto (gênero, ator, diretor, etc.) ---
+  // --- % baseada no gosto (diretor, ator, país, década…) ---
+  // Evidência: se maxPossible é baixo, o algoritmo quase não conhece esse título
+  // pelo seu histórico → tastePct fica perto de 50 (não inventa preferência).
   let fatorConfianca = Math.max(0.50, Math.sqrt(reliability));
   const sinalCru = (maxPossible > 0) ? (raw / maxPossible) : 0;
   let diferencaDoMeio = (sinalCru * 100) - 50;
   let amplificador = 2.2;
-  let tastePct = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
+  let tastePctRaw = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
+  // maxPossible < 10 → evidência fraca; >= 15 → evidência cheia
+  const tasteEvidence = Math.max(0, Math.min(1, maxPossible / 12));
+  let tastePct = 50 + (tastePctRaw - 50) * tasteEvidence;
 
-  // --- % baseada na qualidade externa (IMDb/RT/Meta) — impacto DIRETO e separado ---
-  // Cada ponto acima/abaixo de 6.5 move a % em ~7 pontos.
-  // Filme 5.7 → ~44%; filme 7.7 → ~58%. Isso separa medianos de bem avaliados.
-  // Países penalizados: não aplicam bônus de relevância (qualityPct fica neutro).
+  // --- % baseada na qualidade externa — impacto DIRETO ---
+  // Cada ponto acima/abaixo de 6.5 move ~8 pontos na qualityPct.
   let qualityPct = 50;
   if (extScore != null && !hasExtPenaltyCountry) {
-    qualityPct = 50 + (extScore - 6.5) * 7;
+    qualityPct = 50 + (extScore - 6.5) * 8;
   }
 
-  // Mistura: 50% gosto pessoal + 50% qualidade externa
-  let pctFinal = tastePct * 0.50 + qualityPct * 0.50;
+  // Quando o gosto tem pouca evidência, a qualidade externa manda mais.
+  // Evidência cheia → 50/50; evidência zero → 20% gosto / 80% qualidade.
+  const tasteWeight = 0.20 + 0.30 * tasteEvidence;
+  const qualityWeight = 1 - tasteWeight;
+  let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
   pctFinal = Math.max(0, Math.min(100, pctFinal));
 
   // Penalidades adicionais de origem e temática
@@ -2208,9 +2236,11 @@ function estimateAffinity(movie, person){
       ratio: sinalCru.toFixed(3),
       corr: corr.toFixed(2),
       count,
+      tasteEvidence: tasteEvidence.toFixed(2),
       tastePct: Math.round(tastePct),
       qualityPct: Math.round(qualityPct),
       extScore: extScore != null ? extScore.toFixed(1) : null,
+      tasteW: tasteWeight.toFixed(2),
       pctFinal
     }
   };
@@ -2310,7 +2340,8 @@ function explainRecommendation(movie, person){
   }
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
-  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  const evid = Math.max(0, Math.min(1, maxPossible / 12));
+  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
