@@ -2011,19 +2011,20 @@ function rawTasteSignal(movie, maps){
     });
   }
   const decade = movie.year ? Math.floor(parseInt(movie.year)/10)*10 : null;
-  add(maps.genre, movie.genres||[], 1);
+  // Gênero com peso zero: a pessoa já filtra o gênero que quer assistir na interface.
+  // Combinações gênero+década e gênero+país também zeradas pelo mesmo motivo.
+  add(maps.genre, movie.genres||[], 0);
   if(movie.director) add(maps.director, movie.director.split(',').map(s=>s.trim()), 1.4);
   if(movie.writer) add(maps.writer, movie.writer.split(',').map(s=>s.trim()), 1.0);
   if(movie.actors) add(maps.actor, movie.actors.split(',').map(s=>s.trim()), 1.2);
   add(maps.country, movie.countries||[], 0.8);
   if(decade!=null) add(maps.decade, [decade], 0.8);
   if(movie.production) add(maps.studio, [movie.production], 0.7);
-  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 1.3);
+  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 0);
   (movie.countries||[]).forEach(c=>{
-    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1);
+    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 0);
   });
-  const rb = runtimeBucket(movie.runtimeMin);
-  if(rb) add(maps.runtime, [rb], 0.6);
+  // Duração com peso zero: a pessoa já escolhe conforme o tempo disponível.
   return { raw, maxPossible };
 }
 
@@ -2129,19 +2130,13 @@ function estimateAffinity(movie, person){
     extScore = imdbVal*wImdb + criticAvg*wCritic;
   } else if(imdbVal!=null){ extScore = imdbVal; }
   else if(criticAvg!=null){ extScore = criticAvg; }
-  if(extScore!=null){
-    // Volume de avaliações: nota boa/ruim com MUITOS votos pesa mais (é mais confiável);
-    // com POUCOS votos, o efeito (pra cima ou pra baixo) fica mais brando.
-    // Não aplica bônus de relevância (volume/nota alta) para títulos de Índia, Turquia, Filipinas, Indonésia e Nigéria.
-    const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
-    if (!hasPenaltyCountry) {
-      const votes = ratings.imdbVotes;
-      const voteConfidence = votes!=null ? Math.min(1, Math.log10(votes+1)/6) : 0.4;
-      // Peso maior da crítica externa (1.4) para diferenciar bem avaliados dos medianos
-      raw += (extScore-5.5) * 1.4 * voteConfidence;
-      maxPossible += 5 * 1.4;
-    }
-  }
+  // Nota: a qualidade externa (IMDb/RT/Meta) NÃO entra mais no raw de gosto.
+  // Ela é misturada depois, de forma direta e separada (qualityPct), para não ser
+  // diluída pelos sinais de ator/gênero. Países penalizados continuam sem bônus
+  // via a variável hasPenaltyCountry na etapa final.
+  const hasExtPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
+  // Para países penalizados, a qualityPct será forçada para neutro (50) mais abaixo.
+
 
   state.family.members.forEach(other=>{
     if(other===person) return;
@@ -2158,13 +2153,24 @@ function estimateAffinity(movie, person){
   const { corr } = backtestAccuracy(person);
   const reliability = Math.max(0.15, corr);
 
-  // Piso no fator de confiança: correlação 0.29 não deve esmagar a variação
+  // --- % baseada no gosto (gênero, ator, diretor, etc.) ---
   let fatorConfianca = Math.max(0.50, Math.sqrt(reliability));
   const sinalCru = (maxPossible > 0) ? (raw / maxPossible) : 0;
   let diferencaDoMeio = (sinalCru * 100) - 50;
-  // Amplificador mais forte para espalhar as % (sair da faixa estreita 56-60)
-  let amplificador = 2.5;
-  let pctFinal = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
+  let amplificador = 2.2;
+  let tastePct = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
+
+  // --- % baseada na qualidade externa (IMDb/RT/Meta) — impacto DIRETO e separado ---
+  // Cada ponto acima/abaixo de 6.5 move a % em ~7 pontos.
+  // Filme 5.7 → ~44%; filme 7.7 → ~58%. Isso separa medianos de bem avaliados.
+  // Países penalizados: não aplicam bônus de relevância (qualityPct fica neutro).
+  let qualityPct = 50;
+  if (extScore != null && !hasExtPenaltyCountry) {
+    qualityPct = 50 + (extScore - 6.5) * 7;
+  }
+
+  // Mistura: 50% gosto pessoal + 50% qualidade externa
+  let pctFinal = tastePct * 0.50 + qualityPct * 0.50;
   pctFinal = Math.max(0, Math.min(100, pctFinal));
 
   // Penalidades adicionais de origem e temática
@@ -2193,7 +2199,21 @@ function estimateAffinity(movie, person){
   }
 
   const pct = Math.round(pctFinal);
-  return { ready:true, pct, _debug: { raw: raw.toFixed(2), maxPossible: maxPossible.toFixed(2), ratio: sinalCru.toFixed(3), corr: corr.toFixed(2), count, pctFinal } };
+  return {
+    ready: true,
+    pct,
+    _debug: {
+      raw: raw.toFixed(2),
+      maxPossible: maxPossible.toFixed(2),
+      ratio: sinalCru.toFixed(3),
+      corr: corr.toFixed(2),
+      count,
+      tastePct: Math.round(tastePct),
+      qualityPct: Math.round(qualityPct),
+      extScore: extScore != null ? extScore.toFixed(1) : null,
+      pctFinal
+    }
+  };
   } catch(e) {
     console.error('estimateAffinity failed for', movie && movie.id, e);
     return { ready:false, pct:50 };
@@ -2244,7 +2264,7 @@ function explainRecommendation(movie, person){
     if(best) up.push(`${prefixUp} ${best.k}`);
     if(worst) down.push(`${prefixDown} ${worst.k}`);
   }
-  topReason(maps.genre, movie.genres||[], 'Você costuma gostar de', 'Você costuma não gostar tanto de');
+  // Gênero não entra na explicação: peso zero no algoritmo (a pessoa já filtra o gênero na interface)
   if(movie.director) topReason(maps.director, movie.director.split(',').map(s=>s.trim()), 'Você gosta dos trabalhos de', 'Filmes do diretor');
   if(movie.actors) topReason(maps.actor, movie.actors.split(',').map(s=>s.trim()), 'Você gosta de filmes com', 'Filmes com');
 
