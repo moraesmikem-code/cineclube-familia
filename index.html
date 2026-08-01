@@ -989,17 +989,6 @@ function renderMain(){
     </header>
 
     <div class="panel">
-      <h3>Ordenar</h3>
-      <select id="sort-field" onchange="__setSort(this.value)">
-        ${sortOptions().map(o=>`<option value="${o.v}" ${state.sortField===o.v?'selected':''}>${o.l}</option>`).join('')}
-      </select>
-      <div class="radio-row" style="margin-top:14px">
-        <div class="chip ${state.sortDir==='desc'?'active':''}" onclick="__setDir('desc')">↓ Maior/mais recente primeiro</div>
-        <div class="chip ${state.sortDir==='asc'?'active':''}" onclick="__setDir('asc')">↑ Menor/mais antigo primeiro</div>
-      </div>
-    </div>
-
-    <div class="panel">
       <h3>Filtros</h3>
       <label style="margin-top:0">Tipo</label>
       <div class="radio-row">
@@ -1072,6 +1061,17 @@ function renderMain(){
       </div>
       <div class="hint">Todas as notas (família, IMDb, RT, Metacritic) usam escala 0–10 nesta lista.</div>
       ` : ''}
+    </div>
+
+    <div class="panel">
+      <h3>Ordenar</h3>
+      <select id="sort-field" onchange="__setSort(this.value)">
+        ${sortOptions().map(o=>`<option value="${o.v}" ${state.sortField===o.v?'selected':''}>${o.l}</option>`).join('')}
+      </select>
+      <div class="radio-row" style="margin-top:14px">
+        <div class="chip ${state.sortDir==='desc'?'active':''}" onclick="__setDir('desc')">↓ Maior/mais recente primeiro</div>
+        <div class="chip ${state.sortDir==='asc'?'active':''}" onclick="__setDir('asc')">↑ Menor/mais antigo primeiro</div>
+      </div>
     </div>
 
     <div id="catalog">
@@ -2106,6 +2106,25 @@ const MINORITY_KW_LIST = [
   'bisexual protagonist','bisexual interest','pansexual','pansexual interest',
   'woman pretending to be a man','transgender woman','coming out','coming of age'
 ];
+// Sexismo / feminismo / misoginia — penalidade em QUALQUER época
+const SEXISM_KW_LIST = [
+  'sexism','sexist','misogyny','misogynist','misogynistic','feminism','feminist',
+  'patriarchy','patriarchal','male chauvinism','chauvinism','gender politics',
+  'women\'s rights','womens rights','toxic masculinity','male gaze'
+];
+// Temas raciais — penalidade após 2012
+const RACIAL_KW_LIST = [
+  'racism','racist','racial tension','racial conflict','racial injustice','racial discrimination',
+  'racial prejudice','systemic racism','institutional racism','police brutality',
+  'black lives matter','white privilege','critical race','race relations','racial identity',
+  'segregation','apartheid','civil rights movement'
+];
+// Xenofobia a estrangeiros — penalidade após 2006
+const XENOPHOBIA_KW_LIST = [
+  'xenophobia','xenophobic','anti-immigrant','anti immigration','anti-immigration',
+  'immigrant discrimination','refugee crisis','border wall','illegal immigrant',
+  'nationalism','nativism','foreigner hatred','hate immigrant'
+];
 
 function estimateAffinity(movie, person){
   try {
@@ -2222,6 +2241,57 @@ function estimateAffinity(movie, person){
       hasMinorityTheme = fallbackRe.test(textToCheck);
     }
     if (hasMinorityTheme) {
+      pctFinal = pctFinal * 0.8; // diminui 20%
+    }
+  }
+
+  // Sexismo / feminismo / misoginia: −20% em QUALQUER época
+  {
+    let hasSexismTheme = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      hasSexismTheme = SEXISM_KW_LIST.some(k => kwSet.has(k));
+    }
+    if (!hasSexismTheme) {
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + (movie.genres || []).join(' ')).toLowerCase();
+      const sexismRe = /\b(sexism|sexist|misogyny|misogynist|feminism|feminist|patriarchy|patriarchal|chauvinism|toxic masculinity|male gaze|sexismo|misoginia|feminismo|feminista)\b/i;
+      hasSexismTheme = sexismRe.test(textToCheck);
+    }
+    if (hasSexismTheme) {
+      pctFinal = pctFinal * 0.8; // diminui 20%
+    }
+  }
+
+  // Temas raciais: −20% se ano > 2012
+  if (!isNaN(yearNum) && yearNum > 2012) {
+    let hasRacialTheme = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      hasRacialTheme = RACIAL_KW_LIST.some(k => kwSet.has(k));
+    }
+    if (!hasRacialTheme) {
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + (movie.genres || []).join(' ')).toLowerCase();
+      const racialRe = /\b(racism|racist|racial (tension|conflict|injustice|discrimination|prejudice|identity)|systemic racism|police brutality|black lives matter|white privilege|race relations|racismo|racial)\b/i;
+      hasRacialTheme = racialRe.test(textToCheck);
+    }
+    if (hasRacialTheme) {
+      pctFinal = pctFinal * 0.8; // diminui 20%
+    }
+  }
+
+  // Xenofobia a estrangeiros: −20% se ano > 2006
+  if (!isNaN(yearNum) && yearNum > 2006) {
+    let hasXenoTheme = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      hasXenoTheme = XENOPHOBIA_KW_LIST.some(k => kwSet.has(k));
+    }
+    if (!hasXenoTheme) {
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + (movie.genres || []).join(' ')).toLowerCase();
+      const xenoRe = /\b(xenophobia|xenophobic|anti-?immigrant|anti-?immigration|refugee crisis|nativism|xenofobia|xenófob)\b/i;
+      hasXenoTheme = xenoRe.test(textToCheck);
+    }
+    if (hasXenoTheme) {
       pctFinal = pctFinal * 0.8; // diminui 20%
     }
   }
