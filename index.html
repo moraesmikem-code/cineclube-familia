@@ -542,6 +542,20 @@ async function fetchTmdbIdByTitle(title, year, mediaType){
   return results[0].id;
 }
 
+async function fetchTmdbKeywords(tmdbId, mediaType){
+  try{
+    const path = mediaType === 'series' ? 'tv' : 'movie';
+    const url = `https://api.themoviedb.org/3/${path}/${tmdbId}/keywords?api_key=${encodeURIComponent(state.tmdbKey)}`;
+    const res = await fetchWithTimeout(url);
+    const data = await res.json();
+    // TMDB: movies usam "keywords", séries usam "results"
+    const list = data.keywords || data.results || [];
+    return list.map(k => (k.name || '').toLowerCase().trim()).filter(Boolean);
+  }catch(e){
+    return [];
+  }
+}
+
 async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
   let tmdbId = await fetchTmdbId(imdbId, mediaType);
   if(!tmdbId && fallbackTitle){
@@ -554,12 +568,14 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
     const data = await res.json();
     const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
     const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
+    const keywords = await fetchTmdbKeywords(tmdbId, 'series');
     return {
       tmdbId,
       status: data.status || null,
       nextEpisode: data.next_episode_to_air ? { season:data.next_episode_to_air.season_number, episode:data.next_episode_to_air.episode_number, airDate:data.next_episode_to_air.air_date } : null,
       seasons: (data.seasons||[]).filter(s=>s.season_number>0).map(s=>({ number:s.season_number, episodeCount:s.episode_count, airDate:s.air_date, name:s.name })),
-      streaming
+      streaming,
+      keywords
     };
   }
   const url = `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=release_dates,watch/providers`;
@@ -573,7 +589,8 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
     const theatrical = brBlock.release_dates.find(rd=>rd.type===3) || brBlock.release_dates[0];
     if(theatrical && theatrical.release_date) theatricalBR = theatrical.release_date;
   }
-  return { tmdbId, status: data.status || null, theatricalBR, streaming };
+  const keywords = await fetchTmdbKeywords(tmdbId, 'movie');
+  return { tmdbId, status: data.status || null, theatricalBR, streaming, keywords };
 }
 
 async function fetchTmdbSeasonEpisodes(tmdbId, seasonNumber){
@@ -724,6 +741,7 @@ function ratingSourceOptions(){
   opts.push({v:'imdb', l:'IMDb'});
   opts.push({v:'rtCritics', l:'Rotten Tomatoes'});
   opts.push({v:'metacritic', l:'Metacritic'});
+  opts.push({v:'avgExternal', l:'Média da Crítica (IMDb, RT, Meta)'});
   return opts;
 }
 
@@ -766,11 +784,21 @@ function getFilteredSorted(){
   if(f.ratingOn && f.ratingSource){
     list = list.filter(m=>{
       let val = null;
-      if(f.ratingSource === 'avg') val = familyAvg(m);
-      else if(f.ratingSource.startsWith('member:')){
+      if(f.ratingSource === 'avg') {
+        val = familyAvg(m);
+      } else if (f.ratingSource === 'avgExternal') {
+        // Lógica para somar apenas as notas que existem (ignora os nulls)
+        let sum = 0; let count = 0;
+        if (m.ratings && m.ratings.imdb != null) { sum += m.ratings.imdb; count++; }
+        if (m.ratings && m.ratings.rtCritics != null) { sum += m.ratings.rtCritics; count++; }
+        if (m.ratings && m.ratings.metacritic != null) { sum += m.ratings.metacritic; count++; }
+        if (count > 0) val = sum / count;
+      } else if(f.ratingSource.startsWith('member:')){
         const name = f.ratingSource.split(':')[1];
         val = m.votes[name] ? m.votes[name].score : null;
-      } else val = m.ratings[f.ratingSource];
+      } else {
+        val = m.ratings ? m.ratings[f.ratingSource] : null;
+      }
       if(val==null) return false;
       return Math.floor(val) === Number(f.ratingValue);
     });
@@ -790,7 +818,11 @@ function sortMovieList(list, field, dir){
       case 'imdbVotes': return m.ratings.imdbVotes ?? -1;
       case 'rtCritics': return m.ratings.rtCritics ?? -1;
       case 'metacritic': return m.ratings.metacritic ?? -1;
-      case 'recommendation': return estimateAffinity(m, state.me).pct;
+      case 'recommendation': {
+        const rec = estimateAffinity(m, state.me);
+        // Se a recomendação existir e for válida, retorna a porcentagem. Se não, joga pro final da lista (-1)
+        return (rec && rec.ready && rec.pct != null) ? rec.pct : -1;
+      }
       default:
         if(field.startsWith('member:')){
           const name = field.split(':')[1];
@@ -1392,13 +1424,15 @@ function renderMovieModal(id){
       prompt('Copie o link abaixo:', url);
     }
   };
-  window.__toggleCheckin = async (id)=>{
+  window.__toggleCheckin = (id)=>{
     const movie = state.movies.find(x=>x.id===id);
     if(!movie) return;
     if(!movie.checkins) movie.checkins = {};
     movie.checkins[state.me] = movie.checkins[state.me] ? null : new Date().toISOString();
-    await fbSaveMovie(movie);
+    // Atualiza a tela IMEDIATAMENTE (acaba com a lentidão)
     render();
+    // Salva no banco de dados em segundo plano
+    fbSaveMovie(movie).catch(e => console.error("Erro ao salvar check-in:", e));
   };
   window.__toggleEditRatings = (id)=>{
     state._editingRatings = (state._editingRatings===id) ? null : id;
@@ -1436,6 +1470,7 @@ function renderMovieModal(id){
       movie.tmdbId = details.tmdbId;
       movie.streaming = details.streaming;
       movie.releaseStatus = details.status;
+      if(details.keywords) movie.keywords = details.keywords;
       if(movie.type==='series'){
         movie.nextEpisode = details.nextEpisode;
         movie.seasons = details.seasons;
@@ -1460,13 +1495,21 @@ function renderMovieModal(id){
     state._editingRatings = null;
     render();
   };
-  window.__saveVote = async ()=>{
-    const score = parseInt(document.getElementById('score-slider').value);
+  window.__saveVote = ()=>{
+    const scoreInput = document.getElementById('score-slider').value;
+    const score = parseInt(scoreInput);
     m.votes[state.me] = { liked: pendingLiked, score: score };
-    if(!m.checkins) m.checkins = {};
-    if(!m.checkins[state.me]) m.checkins[state.me] = new Date().toISOString();
-    await fbSaveMovie(m);
+    // TRAVA DE SEGURANÇA: Só faz o check-in automático se a nota for maior que zero
+    if (!isNaN(score) && score > 0) {
+      if (!m.checkins) m.checkins = {};
+      if (!m.checkins[state.me]) {
+        m.checkins[state.me] = new Date().toISOString();
+      }
+    }
+    // Atualiza a tela IMEDIATAMENTE
     render();
+    // Salva no banco de dados em segundo plano
+    fbSaveMovie(m).catch(e => console.error("Erro ao salvar voto:", e));
   };
   window.__deleteMovie = async (id)=>{
     if(!confirm('Remover este filme só da SUA lista? Ele continua no catálogo dos outros, com os votos deles intactos.')) return;
@@ -1635,6 +1678,7 @@ function renderSettingsModal(){
                 movie.tmdbId = details.tmdbId;
                 movie.streaming = details.streaming;
                 movie.releaseStatus = details.status;
+                if(details.keywords) movie.keywords = details.keywords;
                 if(movie.type==='series'){ movie.nextEpisode = details.nextEpisode; movie.seasons = details.seasons; }
                 else { movie.theatricalBR = details.theatricalBR; }
                 movie.lastUpdatedAt = new Date().toISOString();
@@ -2060,10 +2104,15 @@ function estimateAffinity(movie, person){
   if(extScore!=null){
     // Volume de avaliações: nota boa/ruim com MUITOS votos pesa mais (é mais confiável);
     // com POUCOS votos, o efeito (pra cima ou pra baixo) fica mais brando.
-    const votes = movie.ratings.imdbVotes;
-    const voteConfidence = votes!=null ? Math.min(1, Math.log10(votes+1)/6) : 0.4;
-    raw += (extScore-5.5) * 0.6 * voteConfidence;
-    maxPossible += 5*0.6;
+    // Não aplica bônus de relevância (volume/nota alta) para títulos de Índia, Turquia, Filipinas, Indonésia e Nigéria.
+    const PENALTY_COUNTRIES = new Set(['India','Turkey','Philippines','Indonesia','Nigeria','Turquia','Filipinas','Indonésia','Nigéria']);
+    const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
+    if (!hasPenaltyCountry) {
+      const votes = movie.ratings.imdbVotes;
+      const voteConfidence = votes!=null ? Math.min(1, Math.log10(votes+1)/6) : 0.4;
+      raw += (extScore-5.5) * 0.6 * voteConfidence;
+      maxPossible += 5*0.6;
+    }
   }
 
   state.family.members.forEach(other=>{
@@ -2081,10 +2130,57 @@ function estimateAffinity(movie, person){
   const { corr } = backtestAccuracy(person);
   const reliability = Math.max(0.1, corr); // nunca deixa a confiança ir a zero total, mas dói pra correlação negativa/fraca
 
-  const overallConfidence = Math.min(1, count/15);
-  const deviation = (raw/maxPossible) * 50 * overallConfidence * reliability;
-  const pct = Math.max(5, Math.min(95, Math.round(50 + deviation)));
-  return { ready:true, pct, _debug: { raw: raw.toFixed(2), maxPossible: maxPossible.toFixed(2), ratio:(raw/maxPossible).toFixed(3), corr: corr.toFixed(2), count } };
+  // 1. Suaviza a penalidade da confiança usando raiz quadrada (traz mais segurança pro cálculo)
+  let fatorConfianca = Math.sqrt(reliability);
+  // 2. Calcula o quanto a nota se afasta do meio (50%)
+  const sinalCru = (maxPossible > 0) ? (raw / maxPossible) : 0;
+  let diferencaDoMeio = (sinalCru * 100) - 50;
+  // 3. AMPLIFICADOR: Multiplica a diferença para forçar a nota a sair da inércia dos 50%
+  // Valores entre 1.5 e 2.5. Quanto maior, mais extremas ficam as notas.
+  let amplificador = 1.8;
+  // 4. Calcula a porcentagem final esticada
+  let pctFinal = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
+  // 5. Limita o número estritamente entre 0 e 100
+  pctFinal = Math.max(0, Math.min(100, pctFinal));
+
+  // Penalidades adicionais de origem e temática
+  const PENALTY_COUNTRIES = new Set(['India','Turkey','Philippines','Indonesia','Nigeria','Turquia','Filipinas','Indonésia','Nigéria']);
+  const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
+  if (hasPenaltyCountry) {
+    pctFinal = pctFinal * 0.8; // diminui 20%
+  }
+  // Temática de minorias após 1999: −20% se o ano > 1999 e houver palavras-chave típicas
+  // (usa keywords da TMDB quando disponíveis; senão cai na sinopse/gênero)
+  const yearNum = parseInt(movie.year);
+  if (!isNaN(yearNum) && yearNum > 1999) {
+    const MINORITY_KW = [
+      'gay','homosexual','homosexuality','bisexual','bisexuality','lgbt','lgbtq','queer',
+      'transgender','transsexual','gender identity','gender expression','gender nonconforming',
+      'gender reassignment','gender norm','transphobia','homophobia','internalized homophobia',
+      'gay protagonist','gay romance','gay sex','gay kiss','gay friend','gay husband','gay parent',
+      'gay scene','gay interest','gay kid','gay black man','gay african american','gay cowboy',
+      'closeted homosexual','first gay sexual experience','male male kiss','male bisexuality',
+      'bisexual protagonist','bisexual interest','pansexual','pansexual interest',
+      'woman pretending to be a man','transgender woman','coming out','coming of age'
+    ];
+    let hasMinorityTheme = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      hasMinorityTheme = MINORITY_KW.some(k => kwSet.has(k) || [...kwSet].some(mk => mk.includes(k)));
+    }
+    if (!hasMinorityTheme) {
+      // fallback: sinopse + gêneros (para títulos ainda sem keywords carregadas)
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + (movie.genres || []).join(' ')).toLowerCase();
+      const fallbackRe = /\b(lgbt|lgbtq|queer|transgender|homosexual|bisexual|gay protagonist|gender identity|homophobia|transphobia|diversidade|inclusão|identidade de gênero)\b/i;
+      hasMinorityTheme = fallbackRe.test(textToCheck);
+    }
+    if (hasMinorityTheme) {
+      pctFinal = pctFinal * 0.8; // diminui 20%
+    }
+  }
+
+  const pct = Math.round(pctFinal);
+  return { ready:true, pct, _debug: { raw: raw.toFixed(2), maxPossible: maxPossible.toFixed(2), ratio: sinalCru.toFixed(3), corr: corr.toFixed(2), count, pctFinal } };
 }
 
 function computeRecommendations(){
