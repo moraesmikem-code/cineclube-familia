@@ -2137,8 +2137,9 @@ function estimateAffinity(movie, person){
     if (!hasPenaltyCountry) {
       const votes = ratings.imdbVotes;
       const voteConfidence = votes!=null ? Math.min(1, Math.log10(votes+1)/6) : 0.4;
-      raw += (extScore-5.5) * 0.6 * voteConfidence;
-      maxPossible += 5*0.6;
+      // Peso maior da crítica externa (1.4) para diferenciar bem avaliados dos medianos
+      raw += (extScore-5.5) * 1.4 * voteConfidence;
+      maxPossible += 5 * 1.4;
     }
   }
 
@@ -2155,19 +2156,15 @@ function estimateAffinity(movie, person){
 
   // auto-validação: se o modelo historicamente não bate com as notas reais dessa pessoa, ele se contém
   const { corr } = backtestAccuracy(person);
-  const reliability = Math.max(0.1, corr); // nunca deixa a confiança ir a zero total, mas dói pra correlação negativa/fraca
+  const reliability = Math.max(0.15, corr);
 
-  // 1. Suaviza a penalidade da confiança usando raiz quadrada (traz mais segurança pro cálculo)
-  let fatorConfianca = Math.sqrt(reliability);
-  // 2. Calcula o quanto a nota se afasta do meio (50%)
+  // Piso no fator de confiança: correlação 0.29 não deve esmagar a variação
+  let fatorConfianca = Math.max(0.50, Math.sqrt(reliability));
   const sinalCru = (maxPossible > 0) ? (raw / maxPossible) : 0;
   let diferencaDoMeio = (sinalCru * 100) - 50;
-  // 3. AMPLIFICADOR: Multiplica a diferença para forçar a nota a sair da inércia dos 50%
-  // Valores entre 1.5 e 2.5. Quanto maior, mais extremas ficam as notas.
-  let amplificador = 1.8;
-  // 4. Calcula a porcentagem final esticada
+  // Amplificador mais forte para espalhar as % (sair da faixa estreita 56-60)
+  let amplificador = 2.5;
   let pctFinal = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
-  // 5. Limita o número estritamente entre 0 e 100
   pctFinal = Math.max(0, Math.min(100, pctFinal));
 
   // Penalidades adicionais de origem e temática
@@ -2262,17 +2259,18 @@ function explainRecommendation(movie, person){
     }
   });
 
-  const criticVals = [movie.ratings.imdb, movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
+  const r = movie.ratings || {};
+  const criticVals = [r.imdb, r.rtCritics, r.metacritic].filter(v=>v!=null);
   if(criticVals.length){
     const avg = criticVals.reduce((a,b)=>a+b,0)/criticVals.length;
     if(avg>=7.5 && up.length<4) up.push(`Bem avaliado pela crítica/público em geral (${avg.toFixed(1)}/10)`);
-    if(avg<6 && down.length<4) down.push(`Nota da crítica/público é só mediana (${avg.toFixed(1)}/10)`);
+    if(avg<6.5 && down.length<4) down.push(`Nota da crítica/público é só mediana (${avg.toFixed(1)}/10)`);
   } else if(down.length<4){
     down.push('Não há nota de crítica disponível pra usar como referência extra');
   }
-  const votes = movie.ratings.imdbVotes;
+  const votes = r.imdbVotes;
   if(votes!=null){
-    if(votes>=50000 && movie.ratings.imdb!=null && movie.ratings.imdb>=7 && up.length<4){
+    if(votes>=50000 && r.imdb!=null && r.imdb>=7 && up.length<4){
       up.push(`Nota alta com muita gente avaliando no IMDb (${votes.toLocaleString('pt-BR')} votos) — mais confiável`);
     }
     if(votes<1000 && down.length<4){
@@ -2281,25 +2279,18 @@ function explainRecommendation(movie, person){
   }
 
   const { corr } = backtestAccuracy(person);
-  const reliability = Math.max(0.1, corr);
-  const overallConfidence = Math.min(1, count/15);
-  const combinedConfidence = reliability * overallConfidence;
-
   if(count < 15){
     down.push(`Você avaliou ${count} filme(s) até agora — a % fica mais assertiva conforme você avalia mais (o ideal é passar de 15)`);
   }
-  if(corr < 0.5){
-    down.push('O algoritmo ainda está com confiança moderada nos padrões do seu gosto — avalie mais filmes parecidos pra ele ganhar certeza');
-  }
-  // Sempre explica o efeito da confiança geral na %, mesmo quando não há um motivo negativo "nomeável"
-  if(combinedConfidence < 0.85){
-    down.push(`Nível de confiança atual do algoritmo pra você: ${Math.round(combinedConfidence*100)}% — isso "segura" a % pra não subir ou descer demais até ter mais certeza`);
+  if(corr < 0.4){
+    down.push('O algoritmo ainda está calibrando os padrões do seu gosto — quanto mais você avalia, mais as % se diferenciam');
   }
   if(up.length===0 && down.length===0){
     down.push('Não encontrei padrões fortes o suficiente pra puxar a % pra cima ou pra baixo com confiança');
   }
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
-  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} maxPossible=${maxPossible.toFixed(2)} razão=${(raw/maxPossible).toFixed(3)} confiabilidade(corr)=${corr.toFixed(2)} conf.geral=${overallConfidence.toFixed(2)} filmesAvaliados=${count}`);
+  const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
+  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
