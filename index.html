@@ -2178,6 +2178,13 @@ const XENOPHOBIA_KW_LIST = [
   'immigrant discrimination','refugee crisis','border wall','illegal immigrant',
   'nationalism','nativism','foreigner hatred','hate immigrant'
 ];
+// Filosofia / existencialismo — −10% em qualquer época (notas altas, ritmo lento)
+const PHILOSOPHY_KW_LIST = [
+  'philosophy','philosophical','philosopher','existentialism','existential',
+  'existential crisis','metaphysics','metaphysical','nihilism','nihilist',
+  'solipsism','ontology','epistemology','stoicism','absurdism','absurdist',
+  'meaning of life','human condition','philosophical drama'
+];
 
 function estimateAffinity(movie, person){
   try {
@@ -2280,13 +2287,12 @@ function estimateAffinity(movie, person){
     qualityPct = 50 + (qualityPct - 50) * qualityConf;
   }
 
-  // Quando o gosto tem pouca evidência, a qualidade externa manda mais.
-  // Evidência cheia → 50/50; evidência zero → 20% gosto / 80% qualidade.
-  // Mas se a qualidade também tem baixa confiança (sem IMDb), não deixa ela dominar.
-  let tasteWeight = 0.20 + 0.30 * tasteEvidence;
+  // Qualidade externa pesa mais que o gosto pessoal.
+  // Evidência cheia → 30% gosto / 70% qualidade; evidência zero → 10% gosto / 90% qualidade.
+  // Sem IMDb: sobe um pouco o gosto para não deixar um RT isolado dominar.
+  let tasteWeight = 0.10 + 0.20 * tasteEvidence;
   if (imdbVal == null) {
-    // Sem IMDb: não deixa quality dominar — mistura mais neutra
-    tasteWeight = Math.max(tasteWeight, 0.45);
+    tasteWeight = Math.max(tasteWeight, 0.35);
   }
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
@@ -2365,6 +2371,23 @@ function estimateAffinity(movie, person){
     }
     if (hasXenoTheme) {
       pctFinal = pctFinal * 0.8; // diminui 20%
+    }
+  }
+
+  // Filosofia / existencialismo: −10% em QUALQUER época
+  {
+    let hasPhilosophyTheme = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      hasPhilosophyTheme = PHILOSOPHY_KW_LIST.some(k => kwSet.has(k));
+    }
+    if (!hasPhilosophyTheme) {
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + (movie.genres || []).join(' ')).toLowerCase();
+      const philRe = /\b(philosophy|philosophical|philosopher|existentialism|existential|metaphysics|metaphysical|nihilism|absurdism|meaning of life|human condition|filosofia|filosófico|existencialismo|existencial)\b/i;
+      hasPhilosophyTheme = philRe.test(textToCheck);
+    }
+    if (hasPhilosophyTheme) {
+      pctFinal = pctFinal * 0.9; // diminui 10%
     }
   }
 
