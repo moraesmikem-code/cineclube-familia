@@ -808,21 +808,33 @@ function getFilteredSorted(){
 
 function sortMovieList(list, field, dir){
   const dirMul = dir === 'asc' ? 1 : -1;
+
+  // Pré-calcula recomendações UMA vez (evita travar com milhares de títulos)
+  let recMap = null;
+  if(field === 'recommendation'){
+    recMap = new Map();
+    for(const m of list){
+      try{
+        const rec = estimateAffinity(m, state.me);
+        recMap.set(m.id, (rec && rec.ready && rec.pct != null) ? rec.pct : -1);
+      }catch(e){
+        recMap.set(m.id, -1);
+      }
+    }
+  }
+
   function keyOf(m){
     switch(field){
       case 'added': return m.addedAt;
       case 'release': return m.releaseDate || '';
       case 'alpha': return displayTitle(m).toLowerCase();
       case 'runtime': return m.runtimeMin || 0;
-      case 'imdb': return m.ratings.imdb ?? -1;
-      case 'imdbVotes': return m.ratings.imdbVotes ?? -1;
-      case 'rtCritics': return m.ratings.rtCritics ?? -1;
-      case 'metacritic': return m.ratings.metacritic ?? -1;
-      case 'recommendation': {
-        const rec = estimateAffinity(m, state.me);
-        // Se a recomendação existir e for válida, retorna a porcentagem. Se não, joga pro final da lista (-1)
-        return (rec && rec.ready && rec.pct != null) ? rec.pct : -1;
-      }
+      case 'imdb': return (m.ratings && m.ratings.imdb != null) ? m.ratings.imdb : -1;
+      case 'imdbVotes': return (m.ratings && m.ratings.imdbVotes != null) ? m.ratings.imdbVotes : -1;
+      case 'rtCritics': return (m.ratings && m.ratings.rtCritics != null) ? m.ratings.rtCritics : -1;
+      case 'metacritic': return (m.ratings && m.ratings.metacritic != null) ? m.ratings.metacritic : -1;
+      case 'recommendation':
+        return recMap ? (recMap.get(m.id) ?? -1) : -1;
       default:
         if(field.startsWith('member:')){
           const name = field.split(':')[1];
@@ -837,7 +849,8 @@ function sortMovieList(list, field, dir){
     if(ka<kb) return -1*dirMul;
     if(ka>kb) return 1*dirMul;
     if(field==='recommendation'){
-      const ia = a.ratings.imdb ?? -1, ib = b.ratings.imdb ?? -1;
+      const ia = (a.ratings && a.ratings.imdb != null) ? a.ratings.imdb : -1;
+      const ib = (b.ratings && b.ratings.imdb != null) ? b.ratings.imdb : -1;
       if(ia!==ib) return (ia<ib) ? 1 : -1; // desempate: maior nota do IMDb primeiro, sempre
     }
     return 0;
@@ -2070,8 +2083,9 @@ function aggregatorAlignment(person){
     return pearson(xs,ys);
   }
   const result = {
-    imdbCorr: corrWith(m=>m.ratings.imdb),
+    imdbCorr: corrWith(m=>m.ratings && m.ratings.imdb),
     criticCorr: corrWith(m=>{
+      if(!m.ratings) return null;
       const vals=[m.ratings.rtCritics, m.ratings.metacritic].filter(v=>v!=null);
       return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
     })
@@ -2080,7 +2094,20 @@ function aggregatorAlignment(person){
   return result;
 }
 
+const PENALTY_COUNTRIES = new Set(['India','Turkey','Philippines','Indonesia','Nigeria','Turquia','Filipinas','Indonésia','Nigéria']);
+const MINORITY_KW_LIST = [
+  'gay','homosexual','homosexuality','bisexual','bisexuality','lgbt','lgbtq','queer',
+  'transgender','transsexual','gender identity','gender expression','gender nonconforming',
+  'gender reassignment','gender norm','transphobia','homophobia','internalized homophobia',
+  'gay protagonist','gay romance','gay sex','gay kiss','gay friend','gay husband','gay parent',
+  'gay scene','gay interest','gay kid','gay black man','gay african american','gay cowboy',
+  'closeted homosexual','first gay sexual experience','male male kiss','male bisexuality',
+  'bisexual protagonist','bisexual interest','pansexual','pansexual interest',
+  'woman pretending to be a man','transgender woman','coming out','coming of age'
+];
+
 function estimateAffinity(movie, person){
+  try {
   const { maps, count } = buildTasteProfile(person, movie.id);
   if(count < 6) return { ready:false, pct:50 };
 
@@ -2090,9 +2117,10 @@ function estimateAffinity(movie, person){
   // Camada de segurança: consenso de crítica externa, mas pesado por qual agregador mais "bate" com você
   // (algumas pessoas concordam mais com o público do IMDb, outras com a crítica do Metacritic/RT)
   const align = aggregatorAlignment(person);
-  const criticVals = [movie.ratings.rtCritics, movie.ratings.metacritic].filter(v=>v!=null);
+  const ratings = movie.ratings || {};
+  const criticVals = [ratings.rtCritics, ratings.metacritic].filter(v=>v!=null);
   const criticAvg = criticVals.length ? criticVals.reduce((a,b)=>a+b,0)/criticVals.length : null;
-  const imdbVal = movie.ratings.imdb;
+  const imdbVal = ratings.imdb;
   let extScore = null;
   if(imdbVal!=null && criticAvg!=null){
     let wImdb = Math.abs(align.imdbCorr), wCritic = Math.abs(align.criticCorr);
@@ -2105,10 +2133,9 @@ function estimateAffinity(movie, person){
     // Volume de avaliações: nota boa/ruim com MUITOS votos pesa mais (é mais confiável);
     // com POUCOS votos, o efeito (pra cima ou pra baixo) fica mais brando.
     // Não aplica bônus de relevância (volume/nota alta) para títulos de Índia, Turquia, Filipinas, Indonésia e Nigéria.
-    const PENALTY_COUNTRIES = new Set(['India','Turkey','Philippines','Indonesia','Nigeria','Turquia','Filipinas','Indonésia','Nigéria']);
     const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
     if (!hasPenaltyCountry) {
-      const votes = movie.ratings.imdbVotes;
+      const votes = ratings.imdbVotes;
       const voteConfidence = votes!=null ? Math.min(1, Math.log10(votes+1)/6) : 0.4;
       raw += (extScore-5.5) * 0.6 * voteConfidence;
       maxPossible += 5*0.6;
@@ -2144,7 +2171,6 @@ function estimateAffinity(movie, person){
   pctFinal = Math.max(0, Math.min(100, pctFinal));
 
   // Penalidades adicionais de origem e temática
-  const PENALTY_COUNTRIES = new Set(['India','Turkey','Philippines','Indonesia','Nigeria','Turquia','Filipinas','Indonésia','Nigéria']);
   const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
   if (hasPenaltyCountry) {
     pctFinal = pctFinal * 0.8; // diminui 20%
@@ -2153,20 +2179,10 @@ function estimateAffinity(movie, person){
   // (usa keywords da TMDB quando disponíveis; senão cai na sinopse/gênero)
   const yearNum = parseInt(movie.year);
   if (!isNaN(yearNum) && yearNum > 1999) {
-    const MINORITY_KW = [
-      'gay','homosexual','homosexuality','bisexual','bisexuality','lgbt','lgbtq','queer',
-      'transgender','transsexual','gender identity','gender expression','gender nonconforming',
-      'gender reassignment','gender norm','transphobia','homophobia','internalized homophobia',
-      'gay protagonist','gay romance','gay sex','gay kiss','gay friend','gay husband','gay parent',
-      'gay scene','gay interest','gay kid','gay black man','gay african american','gay cowboy',
-      'closeted homosexual','first gay sexual experience','male male kiss','male bisexuality',
-      'bisexual protagonist','bisexual interest','pansexual','pansexual interest',
-      'woman pretending to be a man','transgender woman','coming out','coming of age'
-    ];
     let hasMinorityTheme = false;
     if (movie.keywords && movie.keywords.length) {
       const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
-      hasMinorityTheme = MINORITY_KW.some(k => kwSet.has(k) || [...kwSet].some(mk => mk.includes(k)));
+      hasMinorityTheme = MINORITY_KW_LIST.some(k => kwSet.has(k));
     }
     if (!hasMinorityTheme) {
       // fallback: sinopse + gêneros (para títulos ainda sem keywords carregadas)
@@ -2181,6 +2197,10 @@ function estimateAffinity(movie, person){
 
   const pct = Math.round(pctFinal);
   return { ready:true, pct, _debug: { raw: raw.toFixed(2), maxPossible: maxPossible.toFixed(2), ratio: sinalCru.toFixed(3), corr: corr.toFixed(2), count, pctFinal } };
+  } catch(e) {
+    console.error('estimateAffinity failed for', movie && movie.id, e);
+    return { ready:false, pct:50 };
+  }
 }
 
 function computeRecommendations(){
