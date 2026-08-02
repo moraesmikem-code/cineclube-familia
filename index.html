@@ -958,7 +958,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  const key = person + ':' + ratedCountFor(person);
+  // "v3" no key força recalcular depois da mudança de fórmula
+  const key = 'v3:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -2483,9 +2484,8 @@ function estimateAffinity(movie, person){
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
 
-  // Estica a faixa final: 55% vira ~62%, 65% vira ~78%, 45% vira ~38%.
-  // Assim 10/10 sobem e 5/10 descem de forma mais visível.
-  pctFinal = 50 + (pctFinal - 50) * 1.7;
+  // Estica a faixa final (fórmula v3) — 10/10 sobem, 5/10 descem.
+  pctFinal = 50 + (pctFinal - 50) * 2.2;
   pctFinal = Math.max(5, Math.min(95, pctFinal));
 
   // Penalidades adicionais de origem e temática
@@ -2696,7 +2696,7 @@ function explainRecommendation(movie, person){
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
   const evid = Math.max(0, Math.min(1, maxPossible / 12));
-  down.push(`🔧 Diagnóstico: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  down.push(`🔧 Diagnóstico v3: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
