@@ -1362,7 +1362,7 @@ function renderCard(m){
         ${ratingChip('IMDb', m.ratings && m.ratings.imdb)}
         ${ratingChip('RT', m.ratings && m.ratings.rtCritics)}
         ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
-        ${(()=>{ const myV=m.votes[state.me]; if(myV && myV.score!=null) return ''; const pct=getAffinityPct(m,state.me); return pct>=0 ? `<span>Recomendação: <b style="color:var(--gold)">${pct}%</b></span>` : ''; })()}
+        ${(()=>{ const pct=getAffinityPct(m,state.me); return pct>=0 ? `<span>Recomendação: <b style="color:var(--gold)">${pct}%</b></span>` : ''; })()}
       </div>
       ${checkinHtml}
       <div class="perf"></div>
@@ -1556,11 +1556,13 @@ function renderMovieModal(id){
       </div>
       ${(()=>{
         const myV = m.votes[state.me];
-        if(myV && myV.score!=null) return `<div class="hint" style="margin:6px 0 10px">Você já avaliou este título (nota ${myV.score}/10) — recomendação só aparece pra filmes ainda não avaliados por você.</div>`;
         const r=estimateAffinity(m,state.me);
         if(!r.ready) return `<div class="hint" style="margin:6px 0 10px">Avalie pelo menos 6 filmes pra eu conseguir estimar uma recomendação com confiança.</div>`;
         const { up, down } = explainRecommendation(m, state.me);
-        return `<div style="margin:6px 0 4px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>${explanationHtml(up, down)}`;
+        const already = (myV && myV.score!=null)
+          ? `<div class="hint" style="margin:6px 0 4px">Você avaliou este título com <b style="color:var(--cream)">${myV.score}/10</b> — compare com a previsão do algoritmo:</div>`
+          : '';
+        return `${already}<div style="margin:6px 0 4px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>${explanationHtml(up, down)}`;
       })()}
       ${state._editingRatings===m.id ? `
       <div class="vote-editor">
