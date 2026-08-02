@@ -816,6 +816,7 @@ function sortOptions(){
     {v:'rtCritics', l:'Nota do Rotten Tomatoes'},
     {v:'metacritic', l:'Nota do Metacritic'},
     {v:'recommendation', l:'% de Recomendação (pra mim)'},
+    {v:'familyAvg', l:'Média das notas da família'},
   ];
   state.family.members.forEach(m => opts.push({v:'member:'+m, l:'Nota dada por '+m}));
   return opts;
@@ -830,14 +831,24 @@ function ratingSourceOptions(){
   return opts;
 }
 
+function titleMatchesSearch(m, q){
+  const parts = [m.titlePt, m.titleOriginal, m.titleEn, m.title, displayTitle(m)]
+    .filter(Boolean).map(s=>String(s).toLowerCase());
+  return parts.some(t => t.includes(q));
+}
+
 function getFilteredSorted(){
   let list = state.movies.slice();
   list = list.filter(m => !(m.hiddenBy && m.hiddenBy.includes(state.me)));
   const f = state.filters;
+
+  // Busca: sempre no catálogo inteiro (ignora tipo, gênero, status etc.)
   if(state.search.trim()){
     const q = state.search.trim().toLowerCase();
-    list = list.filter(m => displayTitle(m).toLowerCase().includes(q));
+    list = list.filter(m => titleMatchesSearch(m, q));
+    return sortMovieList(list, state.sortField, state.sortDir);
   }
+
   if(f.mediaType !== 'all'){
     list = list.filter(m => (m.type || 'movie') === f.mediaType);
   }
@@ -1019,6 +1030,10 @@ function sortMovieList(list, field, dir){
       case 'imdbVotes': return (m.ratings && m.ratings.imdbVotes != null) ? m.ratings.imdbVotes : -1;
       case 'rtCritics': return (m.ratings && m.ratings.rtCritics != null) ? m.ratings.rtCritics : -1;
       case 'metacritic': return (m.ratings && m.ratings.metacritic != null) ? m.ratings.metacritic : -1;
+      case 'familyAvg': {
+        const avg = familyAvg(m);
+        return avg != null ? avg : -1;
+      }
       case 'recommendation':
         return recMap ? (recMap.get(m.id) ?? -1) : -1;
       default:
