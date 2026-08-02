@@ -2446,48 +2446,47 @@ function estimateAffinity(movie, person){
   const reliability = Math.max(0.15, corr);
 
   // --- % baseada no gosto (diretor, ator, país, década…) ---
-  // Evidência: se maxPossible é baixo, o algoritmo quase não conhece esse título
-  // pelo seu histórico → tastePct fica perto de 50 (não inventa preferência).
-  let fatorConfianca = Math.max(0.50, Math.sqrt(reliability));
+  // Piso de confiança mais alto: corr 0.19 não deve esmagar a variação.
+  let fatorConfianca = Math.max(0.70, Math.sqrt(reliability));
   const sinalCru = (maxPossible > 0) ? (raw / maxPossible) : 0;
   let diferencaDoMeio = (sinalCru * 100) - 50;
-  let amplificador = 2.2;
+  // Amplificador forte para separar "amei" de "ok"
+  let amplificador = 4.0;
   let tastePctRaw = 50 + (diferencaDoMeio * fatorConfianca * amplificador);
-  // maxPossible < 10 → evidência fraca; >= 15 → evidência cheia
-  const tasteEvidence = Math.max(0, Math.min(1, maxPossible / 12));
+  // Evidência: maxPossible baixo → não inventa preferência
+  const tasteEvidence = Math.max(0, Math.min(1, maxPossible / 10));
   let tastePct = 50 + (tastePctRaw - 50) * tasteEvidence;
 
   // --- % baseada na qualidade externa — impacto DIRETO ---
-  // Cada ponto acima/abaixo de 6.5 move ~8 pontos na qualityPct.
+  // Cada ponto acima/abaixo de 6.5 move ~11 pontos (mais espalhado).
   let qualityPct = 50;
   if (extScore != null && !hasExtPenaltyCountry) {
-    qualityPct = 50 + (extScore - 6.5) * 8;
-    // Confiança da qualidade: sem IMDb ou com poucos votos, puxa para 50.
-    // Impede que um RT isolado (ex.: 9.7 sem IMDb) infle a recomendação.
+    qualityPct = 50 + (extScore - 6.5) * 11;
     let qualityConf = 1;
     if (imdbVal == null) {
-      // Só RT/Meta, sem IMDb → confiança baixa
       qualityConf = 0.25;
     } else if (imdbVotes != null) {
-      // log10(50000)≈4.7 → confiança cheia; <1000 votos → confiança baixa
       qualityConf = Math.min(1, Math.log10(imdbVotes + 1) / 4.7);
       qualityConf = Math.max(0.20, qualityConf);
     } else {
-      qualityConf = 0.45; // tem IMDb mas sem contagem de votos
+      qualityConf = 0.45;
     }
     qualityPct = 50 + (qualityPct - 50) * qualityConf;
   }
 
-  // Qualidade externa pesa mais que o gosto pessoal.
-  // Evidência cheia → 30% gosto / 70% qualidade; evidência zero → 10% gosto / 90% qualidade.
-  // Sem IMDb: sobe um pouco o gosto para não deixar um RT isolado dominar.
-  let tasteWeight = 0.10 + 0.20 * tasteEvidence;
+  // Com evidência forte de diretor/ator, o gosto pessoal pesa mais.
+  // Evidência cheia → 55% gosto / 45% qualidade; fraca → 20% gosto / 80% qualidade.
+  let tasteWeight = 0.20 + 0.35 * tasteEvidence;
   if (imdbVal == null) {
     tasteWeight = Math.max(tasteWeight, 0.35);
   }
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
-  pctFinal = Math.max(0, Math.min(100, pctFinal));
+
+  // Estica a faixa final: 55% vira ~62%, 65% vira ~78%, 45% vira ~38%.
+  // Assim 10/10 sobem e 5/10 descem de forma mais visível.
+  pctFinal = 50 + (pctFinal - 50) * 1.7;
+  pctFinal = Math.max(5, Math.min(95, pctFinal));
 
   // Penalidades adicionais de origem e temática
   const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
