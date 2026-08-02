@@ -1533,22 +1533,6 @@ function renderMovieModal(id){
       </div>
       ${altTitlesLine(m) ? `<p style="font-size:12.5px;color:var(--muted);margin:-6px 0 10px">${escapeHtml(altTitlesLine(m))}</p>` : ''}
       ${posterUrl(m)?`<img class="modal-poster" src="${escapeAttr(posterUrl(m))}" onerror="this.style.display='none'">`:`<div class="poster-ph" style="margin:12px auto;width:140px;height:200px;display:flex;align-items:center;justify-content:center;background:var(--card);border-radius:10px">🎬</div>`}
-      <div style="text-align:center;margin:-4px 0 10px">
-        <button class="icon-btn" style="font-size:12px" onclick="__togglePosterEdit('${m.id}')">🖼️ ${m.posterCustom?'Trocar capa':'Definir capa'}</button>
-      </div>
-      ${state._editingPoster===m.id ? `
-      <div class="vote-editor" id="poster-editor-block" onclick="event.stopPropagation()">
-        <h4>Capa personalizada</h4>
-        <label style="margin-top:0">URL da imagem</label>
-        <input type="url" id="edit-poster-url" value="${escapeAttr(m.posterCustom || m.poster || '')}" placeholder="https://…">
-        <div class="hint">Cole o link de uma imagem (IMDb, TMDB, etc.). Evite arquivos muito grandes.</div>
-        <label>Ou envie um arquivo (fica salvo no aparelho via data-URL — use só se for leve)</label>
-        <input type="file" id="edit-poster-file" accept="image/*" onchange="__previewPosterFile(this)">
-        <div class="field-inline" style="margin-top:10px">
-          <button class="btn btn-gold btn-sm" style="flex:1" onclick="__savePosterCustom('${m.id}')">Salvar capa</button>
-          <button class="btn btn-ghost btn-sm" style="flex:1" onclick="__clearPosterCustom('${m.id}')">Usar capa original</button>
-        </div>
-      </div>` : ''}
       <p class="synopsis">${escapeHtml(displaySynopsis(m)) || '<span style="color:var(--muted)">Sinopse não disponível.</span>'}</p>
       ${m.synopsisAuto ? `<div class="hint">🌐 Sinopse traduzida automaticamente.</div>` : ''}
       <div class="credits">
@@ -1561,8 +1545,10 @@ function renderMovieModal(id){
       </div>
       <div class="ratings-row" style="font-size:13px">
         ${ratingChip('IMDb', m.ratings && m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings && m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
-        <button class="icon-btn" style="font-size:13px" onclick="__toggleEditRatings('${m.id}')">✏️ editar notas</button>
-        <button class="icon-btn" style="font-size:13px" onclick="__refreshExternalData('${m.id}')">🔄 atualizar notas (OMDb)</button>
+      </div>
+      <div class="field-inline" style="margin-top:8px">
+        <button class="btn btn-ghost btn-sm" style="flex:1" onclick="__toggleEditRatings('${m.id}')">✏️ Editar dados</button>
+        <button class="btn btn-ghost btn-sm" style="flex:1" onclick="__refreshExternalData('${m.id}')">🔄 Atualizar (OMDb)</button>
       </div>
 
       <div class="panel" style="margin:12px 0">
@@ -1586,14 +1572,23 @@ function renderMovieModal(id){
       })()}
       ${state._editingRatings===m.id ? `
       <div class="vote-editor" id="ratings-editor-block" onclick="event.stopPropagation()">
-        <h4>Editar notas externas</h4>
-        <label style="margin-top:0">IMDb (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-imdb" value="${m.ratings.imdb ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
+        <h4>Editar dados do título</h4>
+        <label style="margin-top:0">Capa — URL da imagem</label>
+        <input type="url" id="edit-poster-url" value="${escapeAttr(m.posterCustom || m.poster || '')}" placeholder="https://…" onclick="event.stopPropagation()">
+        <div class="hint">Cole o link da capa (IMDb, TMDB…). Ou envie um arquivo leve abaixo.</div>
+        <input type="file" id="edit-poster-file" accept="image/*" onchange="__previewPosterFile(this)">
+        <label>Duração (minutos)</label>
+        <input type="number" min="1" max="999" id="edit-runtime" value="${m.runtimeMin ?? ''}" placeholder="ex: 120" onclick="event.stopPropagation()">
+        <label>Data de lançamento</label>
+        <input type="date" id="edit-release" value="${m.releaseDate ? new Date(m.releaseDate).toISOString().slice(0,10) : ''}" onclick="event.stopPropagation()">
+        <label>IMDb (0–10)</label>
+        <input type="number" step="0.1" min="0" max="10" id="edit-imdb" value="${m.ratings && m.ratings.imdb != null ? m.ratings.imdb : ''}" onclick="event.stopPropagation()">
         <label>RT — Críticos (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings.rtCritics ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
+        <input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings && m.ratings.rtCritics != null ? m.ratings.rtCritics : ''}" onclick="event.stopPropagation()">
         <label>Metacritic (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-mc" value="${m.ratings.metacritic ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
-        <button class="btn btn-gold btn-block" style="margin-top:12px" onclick="__saveExternalRatings('${m.id}')">Salvar notas</button>
+        <input type="number" step="0.1" min="0" max="10" id="edit-mc" value="${m.ratings && m.ratings.metacritic != null ? m.ratings.metacritic : ''}" onclick="event.stopPropagation()">
+        <button class="btn btn-gold btn-block" style="margin-top:12px" onclick="__saveExternalRatings('${m.id}')">Salvar alterações</button>
+        <button class="btn btn-ghost btn-block" style="margin-top:6px" onclick="__clearPosterCustom('${m.id}')">Remover capa personalizada</button>
       </div>` : ''}
 
       <div class="field-inline" style="margin-top:14px">
@@ -1707,7 +1702,7 @@ function renderMovieModal(id){
       if(m2) m2.scrollTop = scrollTop;
       const ed = document.getElementById('ratings-editor-block');
       if(ed) ed.scrollIntoView({ block: 'nearest', behavior: 'instant' });
-      const first = document.getElementById('edit-imdb');
+      const first = document.getElementById('edit-poster-url') || document.getElementById('edit-runtime');
       if(first) try{ first.focus({ preventScroll: true }); }catch(e){ first.focus(); }
     });
   };
@@ -1819,12 +1814,25 @@ function renderMovieModal(id){
     const movie = state.movies.find(x=>x.id===id);
     if(!movie) return;
     if(!movie.ratings) movie.ratings = {};
-    const imdb = document.getElementById('edit-imdb').value;
-    const rtc = document.getElementById('edit-rtc').value;
-    const mc = document.getElementById('edit-mc').value;
+    const imdb = document.getElementById('edit-imdb')?.value ?? '';
+    const rtc = document.getElementById('edit-rtc')?.value ?? '';
+    const mc = document.getElementById('edit-mc')?.value ?? '';
     movie.ratings.imdb = imdb!=='' ? parseFloat(imdb) : null;
     movie.ratings.rtCritics = rtc!=='' ? parseFloat(rtc) : null;
     movie.ratings.metacritic = mc!=='' ? parseFloat(mc) : null;
+    // Duração
+    const rt = document.getElementById('edit-runtime')?.value ?? '';
+    movie.runtimeMin = rt!=='' && !isNaN(parseInt(rt)) ? parseInt(rt) : (rt==='' ? null : movie.runtimeMin);
+    // Data de lançamento
+    const rel = document.getElementById('edit-release')?.value ?? '';
+    if(rel){
+      const d = new Date(rel+'T12:00:00');
+      movie.releaseDate = isNaN(d.getTime()) ? movie.releaseDate : d.toISOString();
+      if(!movie.year) movie.year = String(d.getFullYear());
+    }
+    // Capa personalizada
+    const poster = (document.getElementById('edit-poster-url')?.value || '').trim();
+    if(poster) movie.posterCustom = poster;
     await fbSaveMovie(movie);
     state._editingRatings = null;
     render();
