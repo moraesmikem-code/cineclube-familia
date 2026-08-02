@@ -958,8 +958,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  // "v4" no key força recalcular depois da mudança de fórmula
-  const key = 'v4:' + person + ':' + ratedCountFor(person);
+  // "v5" no key força recalcular depois da mudança de fórmula
+  const key = 'v5:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -1331,10 +1331,13 @@ function ratingChip(label, val, scale){
   if(isNaN(n)) return `<span>${label}: <span style="color:var(--muted)">—</span></span>`;
   return `<span>${label}: <b>${n.toFixed(1)}</b></span>`;
 }
+function posterUrl(m){
+  return (m && (m.posterCustom || m.poster)) || '';
+}
 
 function renderCard(m){
   const genres = (m.genres||[]).slice(0,3);
-  const posterHtml = m.poster ? `<img class="poster" src="${m.poster}" alt="">` : `<div class="poster-ph">🎬</div>`;
+  const posterHtml = posterUrl(m) ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="">` : `<div class="poster-ph">🎬</div>`;
   const votesHtml = state.family.members.map(name=>{
     const v = m.votes[name];
     const mine = name === state.me;
@@ -1529,7 +1532,23 @@ function renderMovieModal(id){
         <button class="close-x" onclick="__closeMovie()">×</button>
       </div>
       ${altTitlesLine(m) ? `<p style="font-size:12.5px;color:var(--muted);margin:-6px 0 10px">${escapeHtml(altTitlesLine(m))}</p>` : ''}
-      ${m.poster?`<img class="modal-poster" src="${m.poster}" onerror="this.style.display='none'">`:''}
+      ${posterUrl(m)?`<img class="modal-poster" src="${escapeAttr(posterUrl(m))}" onerror="this.style.display='none'">`:`<div class="poster-ph" style="margin:12px auto;width:140px;height:200px;display:flex;align-items:center;justify-content:center;background:var(--card);border-radius:10px">🎬</div>`}
+      <div style="text-align:center;margin:-4px 0 10px">
+        <button class="icon-btn" style="font-size:12px" onclick="__togglePosterEdit('${m.id}')">🖼️ ${m.posterCustom?'Trocar capa':'Definir capa'}</button>
+      </div>
+      ${state._editingPoster===m.id ? `
+      <div class="vote-editor" id="poster-editor-block" onclick="event.stopPropagation()">
+        <h4>Capa personalizada</h4>
+        <label style="margin-top:0">URL da imagem</label>
+        <input type="url" id="edit-poster-url" value="${escapeAttr(m.posterCustom || m.poster || '')}" placeholder="https://…">
+        <div class="hint">Cole o link de uma imagem (IMDb, TMDB, etc.). Evite arquivos muito grandes.</div>
+        <label>Ou envie um arquivo (fica salvo no aparelho via data-URL — use só se for leve)</label>
+        <input type="file" id="edit-poster-file" accept="image/*" onchange="__previewPosterFile(this)">
+        <div class="field-inline" style="margin-top:10px">
+          <button class="btn btn-gold btn-sm" style="flex:1" onclick="__savePosterCustom('${m.id}')">Salvar capa</button>
+          <button class="btn btn-ghost btn-sm" style="flex:1" onclick="__clearPosterCustom('${m.id}')">Usar capa original</button>
+        </div>
+      </div>` : ''}
       <p class="synopsis">${escapeHtml(displaySynopsis(m)) || '<span style="color:var(--muted)">Sinopse não disponível.</span>'}</p>
       ${m.synopsisAuto ? `<div class="hint">🌐 Sinopse traduzida automaticamente.</div>` : ''}
       <div class="credits">
@@ -1566,14 +1585,14 @@ function renderMovieModal(id){
         return `${already}<div style="margin:6px 0 4px;font-size:15px">🎯 Recomendação pra você: <b style="color:var(--gold);font-size:20px;font-family:'Bebas Neue'">${r.pct}%</b></div>${explanationHtml(up, down)}`;
       })()}
       ${state._editingRatings===m.id ? `
-      <div class="vote-editor">
+      <div class="vote-editor" id="ratings-editor-block" onclick="event.stopPropagation()">
         <h4>Editar notas externas</h4>
         <label style="margin-top:0">IMDb (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-imdb" value="${m.ratings.imdb ?? ''}">
+        <input type="number" step="0.1" min="0" max="10" id="edit-imdb" value="${m.ratings.imdb ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
         <label>RT — Críticos (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings.rtCritics ?? ''}">
+        <input type="number" step="0.1" min="0" max="10" id="edit-rtc" value="${m.ratings.rtCritics ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
         <label>Metacritic (0–10)</label>
-        <input type="number" step="0.1" min="0" max="10" id="edit-mc" value="${m.ratings.metacritic ?? ''}">
+        <input type="number" step="0.1" min="0" max="10" id="edit-mc" value="${m.ratings.metacritic ?? ''}" onclick="event.stopPropagation()" onfocus="event.stopPropagation()">
         <button class="btn btn-gold btn-block" style="margin-top:12px" onclick="__saveExternalRatings('${m.id}')">Salvar notas</button>
       </div>` : ''}
 
@@ -1678,7 +1697,64 @@ function renderMovieModal(id){
     fbSaveMovie(movie).catch(e => console.error("Erro ao salvar check-in:", e));
   };
   window.__toggleEditRatings = (id)=>{
+    const modal = document.querySelector('#movie-overlay .modal');
+    const scrollTop = modal ? modal.scrollTop : 0;
     state._editingRatings = (state._editingRatings===id) ? null : id;
+    state._editingPoster = null;
+    render();
+    requestAnimationFrame(()=>{
+      const m2 = document.querySelector('#movie-overlay .modal');
+      if(m2) m2.scrollTop = scrollTop;
+      const ed = document.getElementById('ratings-editor-block');
+      if(ed) ed.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+      const first = document.getElementById('edit-imdb');
+      if(first) try{ first.focus({ preventScroll: true }); }catch(e){ first.focus(); }
+    });
+  };
+  window.__togglePosterEdit = (id)=>{
+    const modal = document.querySelector('#movie-overlay .modal');
+    const scrollTop = modal ? modal.scrollTop : 0;
+    state._editingPoster = (state._editingPoster===id) ? null : id;
+    state._editingRatings = null;
+    render();
+    requestAnimationFrame(()=>{
+      const m2 = document.querySelector('#movie-overlay .modal');
+      if(m2) m2.scrollTop = scrollTop;
+      const ed = document.getElementById('poster-editor-block');
+      if(ed) ed.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    });
+  };
+  window.__previewPosterFile = (input)=>{
+    const file = input.files && input.files[0];
+    if(!file) return;
+    if(file.size > 900000){
+      alert('Imagem grande demais (máx. ~900 KB). Use uma URL em vez de arquivo.');
+      input.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      const urlInput = document.getElementById('edit-poster-url');
+      if(urlInput) urlInput.value = reader.result;
+    };
+    reader.readAsDataURL(file);
+  };
+  window.__savePosterCustom = async (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    const url = (document.getElementById('edit-poster-url')?.value || '').trim();
+    if(!url){ alert('Cole uma URL de imagem ou envie um arquivo.'); return; }
+    movie.posterCustom = url;
+    state._editingPoster = null;
+    await fbSaveMovie(movie);
+    render();
+  };
+  window.__clearPosterCustom = async (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    delete movie.posterCustom;
+    state._editingPoster = null;
+    await fbSaveMovie(movie);
     render();
   };
   window.__refreshExternalData = async (id)=>{
@@ -1824,8 +1900,10 @@ function renderSettingsModal(){
       <div id="copy-catalog-msg"></div>
       <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__dedupeCatalog()">🧹 Verificar e remover duplicados</button>
       <div id="dedupe-msg"></div>
-      <p class="hint" style="margin-top:10px">Esse botão verifica, filme por filme, notas (RT/Metacritic), país/idioma, e — se a chave TMDB estiver configurada — também estreias, streaming e novas temporadas/episódios. ⏳ Com um catálogo grande (centenas/milhares de títulos), pode levar bastante tempo — deixe a tela aberta.</p>
+      <p class="hint" style="margin-top:10px">Atualiza notas (RT/Metacritic), país/idioma e — com TMDB — estreias, streaming e temporadas. ⏳ Catálogo grande pode demorar; deixe a tela aberta.</p>
       <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__updateCatalogAll()">🔄 Atualizar catálogo completo</button>
+      <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__updateCatalogOptimized()">⚡ Atualizar só séries ativas + filmes ≤ 1 ano</button>
+      <div class="hint">O modo otimizado economiza a cota diária da OMDb (séries em andamento e filmes dos últimos 365 dias).</div>
       <div class="hint">${state.lastGeneralUpdateAt ? 'Última atualização geral: '+new Date(state.lastGeneralUpdateAt).toLocaleString('pt-BR') : 'Ainda não foi feita nenhuma atualização geral.'}</div>
       <div id="update-catalog-msg"></div>
       <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__closeSettings(); __openErrorLog();">🕘 Ver histórico de erros ${((state.updateErrorLog?state.updateErrorLog.length:0)+(state.importErrorLog?state.importErrorLog.length:0))>0 ? '('+((state.updateErrorLog?state.updateErrorLog.length:0)+(state.importErrorLog?state.importErrorLog.length:0))+')' : ''}</button>
@@ -1896,7 +1974,8 @@ function renderSettingsModal(){
       ? `<div class="msg-ok">${merged} duplicado(s) encontrados e fundidos — os votos foram preservados.</div>`
       : `<div class="msg-ok">Nenhum duplicado encontrado. Catálogo já está limpo.</div>`;
   };
-  window.__updateCatalogAll = async ()=>{
+  async function runCatalogUpdate(mode){
+    // mode: 'all' | 'optimized'
     if(!state.apiKey){
       document.getElementById('update-catalog-msg').innerHTML = `<div class="msg-error">Configure a chave da OMDb primeiro.</div>`;
       return;
@@ -1904,16 +1983,44 @@ function renderSettingsModal(){
     state.catalogUpdateCancelled = false;
     const msgEl = document.getElementById('update-catalog-msg');
 
+    const now = Date.now();
+    const yearMs = 365 * 24 * 60 * 60 * 1000;
+    function needsFrequentUpdate(m){
+      if(m.type === 'series'){
+        const st = (m.releaseStatus || '').toLowerCase();
+        if(st && /end|cancel|pilot/.test(st)) return false;
+        return true;
+      }
+      if(m.releaseDate){
+        const t = new Date(m.releaseDate).getTime();
+        if(!isNaN(t) && (now - t) <= yearMs) return true;
+      }
+      const y = parseInt(m.year);
+      if(!isNaN(y) && y >= new Date().getFullYear() - 1) return true;
+      return false;
+    }
+
+    const progressKey = mode === 'optimized'
+      ? 'cineclube-catalog-update-progress-opt'
+      : 'cineclube-catalog-update-progress';
+
     let processedIds = new Set();
     try{
-      const raw = localStorage.getItem('cineclube-catalog-update-progress');
+      const raw = localStorage.getItem(progressKey);
       if(raw) processedIds = new Set(JSON.parse(raw));
     }catch(e){}
 
     let updated = 0, errors = 0, stopped = false, cancelled = false;
     const failedTitles = [];
-    const toProcess = state.movies.filter(m=>!processedIds.has(m.id));
+    const pool = mode === 'optimized'
+      ? state.movies.filter(needsFrequentUpdate)
+      : state.movies.slice();
+    const toProcess = pool.filter(m=>!processedIds.has(m.id));
     const alreadyDone = processedIds.size;
+    if(mode === 'optimized'){
+      msgEl.innerHTML = `<div class="hint">Modo otimizado: ${pool.length} títulos elegíveis (séries ativas + filmes ≤ 1 ano).</div>`;
+      await new Promise(res=>setTimeout(res, 400));
+    }
 
     if(alreadyDone > 0 && toProcess.length > 0){
       msgEl.innerHTML = `<div class="hint">Retomando de onde parou: ${alreadyDone} já feitos antes, faltam ${toProcess.length}.</div>`;
@@ -1923,7 +2030,7 @@ function renderSettingsModal(){
     try{
       for(let i=0;i<toProcess.length;i++){
         if(state.catalogUpdateCancelled){ cancelled = true; break; }
-        msgEl.innerHTML = `<div class="hint">Atualizando ${alreadyDone+i+1}/${state.movies.length}... (${updated} ok, ${errors} erro)</div>
+        msgEl.innerHTML = `<div class="hint">Atualizando ${i+1}/${toProcess.length} elegíveis... (${updated} ok, ${errors} erro)</div>
           <button class="btn btn-danger btn-sm" style="margin-top:6px" onclick="__cancelCatalogUpdate()">⏹ Parar atualização</button>`;
         const movie = toProcess[i];
         try{
@@ -1951,17 +2058,19 @@ function renderSettingsModal(){
           if(/limit|429|quota/i.test(e.message||'')){ stopped = true; break; }
         }
         processedIds.add(movie.id);
-        try{ localStorage.setItem('cineclube-catalog-update-progress', JSON.stringify(Array.from(processedIds))); }catch(e){}
+        try{ localStorage.setItem(progressKey, JSON.stringify(Array.from(processedIds))); }catch(e){}
         await new Promise(res=>setTimeout(res, 350));
       }
     }catch(fatalErr){
-      msgEl.innerHTML = `<div class="msg-error">Erro inesperado: ${escapeHtml(fatalErr.message || String(fatalErr))}</div><div class="hint">O que já foi feito está salvo — toque em "Atualizar catálogo completo" de novo pra continuar de onde parou.</div>`;
+      msgEl.innerHTML = `<div class="msg-error">Erro inesperado: ${escapeHtml(fatalErr.message || String(fatalErr))}</div><div class="hint">O que já foi feito está salvo — toque no mesmo botão de novo pra continuar de onde parou.</div>`;
       return;
     }
     if(!stopped && !cancelled){
-      state.lastGeneralUpdateAt = new Date().toISOString();
-      await sSet('last-general-update', state.lastGeneralUpdateAt, true);
-      try{ localStorage.removeItem('cineclube-catalog-update-progress'); }catch(e){}
+      if(mode === 'all'){
+        state.lastGeneralUpdateAt = new Date().toISOString();
+        await sSet('last-general-update', state.lastGeneralUpdateAt, true);
+      }
+      try{ localStorage.removeItem(progressKey); }catch(e){}
     }
     if(failedTitles.length){
       if(!state.updateErrorLog) state.updateErrorLog = [];
@@ -1969,13 +2078,16 @@ function renderSettingsModal(){
       state.updateErrorLog = state.updateErrorLog.slice(0,10);
       await sSet('update-error-log', JSON.stringify(state.updateErrorLog), true);
     }
+    const modeLabel = mode === 'optimized' ? 'Atualização otimizada' : 'Catálogo completo';
     msgEl.innerHTML = (cancelled
-      ? `<div class="msg-error">Atualização interrompida por você. Progresso salvo — toque em "Atualizar catálogo completo" de novo pra continuar.</div>`
+      ? `<div class="msg-error">Atualização interrompida por você. Progresso salvo — toque no mesmo botão de novo pra continuar.</div>`
       : stopped
       ? `<div class="msg-error">Parei — provavelmente bati o limite diário da OMDb. Progresso salvo, tenta de novo amanhã pra continuar de onde parou.</div>`
-      : `<div class="msg-ok">Catálogo atualizado! ${updated} títulos, ${errors} erro(s).</div>`)
+      : `<div class="msg-ok">${modeLabel}: ${updated} títulos, ${errors} erro(s).</div>`)
       + (failedTitles.length ? `<div class="hint" style="margin-top:6px">Títulos com erro: ${failedTitles.map(t=>escapeHtml(t.title+(t.year?' ('+t.year+')':''))).join(', ')} — veja também em "🕘 Ver erros das últimas atualizações".</div>` : '');
-  };
+  }
+  window.__updateCatalogAll = ()=> runCatalogUpdate('all');
+  window.__updateCatalogOptimized = ()=> runCatalogUpdate('optimized');
   window.__cancelCatalogUpdate = ()=>{ state.catalogUpdateCancelled = true; };
   window.__saveKey = async ()=>{
     const val = document.getElementById('api-key-input').value.trim();
@@ -2137,7 +2249,11 @@ function buildTasteProfileRaw(person, excludeId){
     (m.genres||[]).forEach(g=>{
       bump(maps.genre, g, w);
       if(decade!=null) bump(maps.genreDecade, g+'|'+decade, w);
-      (m.countries||[]).forEach(c=>bump(maps.genreCountry, g+'|'+c, w));
+      (m.countries||[]).forEach(c=>{
+        bump(maps.genreCountry, g+'|'+c, w);
+        const cont = countryToContinent(c);
+        if(cont) bump(maps.genreCountry, g+'|cont:'+cont, w);
+      });
     });
     if(m.director) m.director.split(',').map(s=>s.trim()).forEach(d=>bump(maps.director, d, w));
     if(m.writer) m.writer.split(',').map(s=>s.trim()).forEach(wr=>bump(maps.writer, wr, w));
@@ -2256,8 +2372,7 @@ function rawTasteSignal(movie, maps){
     });
   }
   const decade = movie.year ? Math.floor(parseInt(movie.year)/10)*10 : null;
-  // Gênero com peso zero: a pessoa já filtra o gênero que quer assistir na interface.
-  // Combinações gênero+década e gênero+país também zeradas pelo mesmo motivo.
+  // Gênero sozinho = 0 (filtro na UI). Gênero+década/país/continente = sim.
   add(maps.genre, movie.genres||[], 0);
   if(movie.director) add(maps.director, movie.director.split(',').map(s=>s.trim()), 1.4);
   if(movie.writer) add(maps.writer, movie.writer.split(',').map(s=>s.trim()), 1.0);
@@ -2265,11 +2380,12 @@ function rawTasteSignal(movie, maps){
   add(maps.country, movie.countries||[], 0.8);
   if(decade!=null) add(maps.decade, [decade], 0.8);
   if(movie.production) add(maps.studio, [movie.production], 0.7);
-  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 0);
+  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 1.3);
   (movie.countries||[]).forEach(c=>{
-    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 0);
+    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1);
+    const cont = countryToContinent(c);
+    if(cont) add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|cont:'+cont), 1.0);
   });
-  // Duração com peso zero: a pessoa já escolhe conforme o tempo disponível.
   return { raw, maxPossible };
 }
 
@@ -2475,22 +2591,20 @@ function estimateAffinity(movie, person){
     qualityPct = 50 + (qualityPct - 50) * qualityConf;
   }
 
-  // Evidência forte → gosto pesa mais; evidência fraca → qualidade manda.
-  let tasteWeight = 0.20 + 0.35 * tasteEvidence;
+  // Evidência cheia → 35% gosto / 65% qualidade; fraca → 15% gosto / 85% qualidade.
+  // Sem IMDb: mantém piso no gosto para não deixar RT isolado dominar.
+  let tasteWeight = 0.15 + 0.20 * tasteEvidence;
   if (imdbVal == null) {
     tasteWeight = Math.max(tasteWeight, 0.35);
   }
-  // Nota externa sólida (IMDb/média ≥ 7): não deixa gosto só levemente negativo afundar o filme
-  // (caso Os Implacáveis: qualidade boa, gosto neutro/leve negativo → não deveria cair a 43%)
+  // Nota externa sólida (≥ 7): não deixa gosto só levemente negativo afundar o filme
   if (extScore != null && extScore >= 7.0 && tastePct < 50) {
-    tasteWeight = Math.min(tasteWeight, 0.30);
+    tasteWeight = Math.min(tasteWeight, 0.25);
   }
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
 
-  // Esticamento ASSIMÉTRICO (v4):
-  // — acima de 50%: estica forte (10/10 sobem para 75–90%)
-  // — abaixo de 50%: estica pouco (não pune demais filmes com nota externa ok)
+  // Esticamento ASSIMÉTRICO (v4)
   if (pctFinal >= 50) {
     pctFinal = 50 + (pctFinal - 50) * 2.0;
   } else {
@@ -2502,6 +2616,21 @@ function estimateAffinity(movie, person){
   const hasPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
   if (hasPenaltyCountry) {
     pctFinal = pctFinal * 0.8; // diminui 20%
+  }
+
+  // Volume por país: se o usuário avaliou < 6 filmes do país principal → −15%
+  {
+    const mainCountry = (movie.countries || [])[0];
+    if (mainCountry) {
+      let n = 0;
+      for (let i = 0; i < state.movies.length; i++) {
+        const m2 = state.movies[i];
+        if (m2.id === movie.id) continue;
+        const v2 = m2.votes && m2.votes[person];
+        if (v2 && v2.score != null && (m2.countries || []).includes(mainCountry)) n++;
+      }
+      if (n < 6) pctFinal = pctFinal * 0.85;
+    }
   }
   // Temática de minorias após 1999: −20% se o ano > 1999 e houver palavras-chave típicas
   // (usa keywords da TMDB quando disponíveis; senão cai na sinopse/gênero)
@@ -2706,7 +2835,7 @@ function explainRecommendation(movie, person){
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
   const evid = Math.max(0, Math.min(1, maxPossible / 12));
-  down.push(`🔧 Diagnóstico v4: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  down.push(`🔧 Diagnóstico v5: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
