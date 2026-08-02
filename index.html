@@ -2663,6 +2663,77 @@ const COMMIE_CRITIQUE_KW_LIST = [
   'escape from communism','defector','dissident','iron curtain escape',
   'crítica ao comunismo','crítica ao socialismo','anticomunista'
 ];
+// Títulos que o usuário pediu para penalizar explicitamente (−20%)
+const COMMIE_FORCE_PENALTY_IMDB = new Set([
+  'tt6016744',   // Democracia em Vertigem / The Edge of Democracy
+  'tt14961016',  // Ainda Estou Aqui / I'm Still Here
+  'tt27847051',  // O Agente Secreto / The Secret Agent
+]);
+const COMMIE_FORCE_PENALTY_TITLES = [
+  'democracia em vertigem', 'edge of democracy',
+  'ainda estou aqui', "i'm still here", 'im still here',
+  'o agente secreto', 'the secret agent'
+];
+// Diretores associados a cinema político de esquerda (BR e afins)
+const POLITICAL_LEFT_DIRECTORS = [
+  'petra costa',
+  'kleber mendonça filho', 'kleber mendonca filho',
+  'juliano dornelles',
+  'adirley queirós', 'adirley queiros',
+  'laís bodanzky', 'lais bodanzky',
+  'anna muylaert',
+  'karim aïnouz', 'karim ainouz',
+];
+// Temas políticos pró-esquerda / denúncia (keywords e sinopse)
+const POLITICAL_LEFT_THEME_KW = [
+  'impeachment', 'lula', 'luiz inácio', 'luiz inacio', 'partido dos trabalhadores',
+  'workers party', 'dilma', 'dilma rousseff',
+  'military dictatorship', 'brazilian dictatorship', 'ditadura militar',
+  'political documentary', 'documentário político', 'documentario politico',
+  'left-wing', 'left wing politics', 'social justice', 'class struggle',
+  'golpe de 2016', 'lawfare', 'petismo'
+];
+function _normTxt(s){
+  return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+}
+function isForcedCommiePenalty(movie){
+  const id = String(movie.imdbId || movie.id || '').toLowerCase();
+  if(COMMIE_FORCE_PENALTY_IMDB.has(id)) return true;
+  const titles = [movie.titlePt, movie.titleEn, movie.titleOriginal, movie.title, displayTitle(movie)]
+    .filter(Boolean).map(t => _normTxt(t));
+  if(COMMIE_FORCE_PENALTY_TITLES.some(needle => {
+    const n = _normTxt(needle);
+    return titles.some(t => t === n || t.includes(n));
+  })) return true;
+
+  // Diretores associados a certo cinema político
+  const dir = _normTxt(movie.director || '');
+  if(dir && POLITICAL_LEFT_DIRECTORS.some(d => dir.includes(_normTxt(d)))) return true;
+
+  const countries = (movie.countries || []).map(c => _normTxt(c));
+  const isBR = countries.some(c => c.includes('brasil') || c.includes('brazil'));
+  const genres = (movie.genres || []).map(g => _normTxt(g));
+  const isDoc = genres.some(g => g.includes('document'));
+  const year = parseInt(movie.year);
+  const isContemporary = !isNaN(year) && year >= 2010;
+  const kwList = (movie.keywords || []).map(k => _normTxt(k));
+  const text = _normTxt((movie.synopsisPt || '') + ' ' + (movie.plot || '') + ' ' + kwList.join(' '));
+
+  const hasLeftTheme = POLITICAL_LEFT_THEME_KW.some(k => {
+    const n = _normTxt(k);
+    return kwList.some(kw => kw.includes(n) || n.includes(kw)) || text.includes(n);
+  });
+  // Tom de denúncia (sinopse)
+  const hasDenuncia = /\b(denuncia|denúncia|injustica|injustiça|resistencia|resistência|oppress|opressao|opressão|golpe|lawfare|persecu|autoritarismo)\b/i.test(text);
+
+  // Documentário político contemporâneo brasileiro + tema/denúncia
+  if(isBR && isDoc && isContemporary && (hasLeftTheme || hasDenuncia)) return true;
+
+  // Brasil + (impeachment/Lula/PT/ditadura) + tom de denúncia
+  if(isBR && hasLeftTheme && hasDenuncia) return true;
+
+  return false;
+}
 
 function estimateAffinity(movie, person){
   try {
@@ -2894,26 +2965,27 @@ function estimateAffinity(movie, person){
     }
   }
 
-  // Propaganda pró-comunismo/socialismo: −20% (não pune crítica nem só ambientação)
+  // Propaganda pró-comunismo/socialismo: −20%
+  // + lista explícita de títulos (Democracia em Vertigem, Ainda Estou Aqui, O Agente Secreto…)
   {
-    let hasCommiePropaganda = false;
+    let hasCommiePropaganda = isForcedCommiePenalty(movie);
     let isCritiqueOrContext = false;
-    if (movie.keywords && movie.keywords.length) {
-      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
-      isCritiqueOrContext = COMMIE_CRITIQUE_KW_LIST.some(k => kwSet.has(k));
-      if (!isCritiqueOrContext) {
-        hasCommiePropaganda = COMMIE_PROPAGANDA_KW_LIST.some(k => kwSet.has(k));
+    if (!hasCommiePropaganda) {
+      if (movie.keywords && movie.keywords.length) {
+        const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+        isCritiqueOrContext = COMMIE_CRITIQUE_KW_LIST.some(k => kwSet.has(k));
+        if (!isCritiqueOrContext) {
+          hasCommiePropaganda = COMMIE_PROPAGANDA_KW_LIST.some(k => kwSet.has(k));
+        }
       }
-    }
-    if (!hasCommiePropaganda && !isCritiqueOrContext) {
-      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '')).toLowerCase();
-      // Crítica explícita → não penaliza
-      if (/\b(anti-?communis|anti-?socialis|crítica ao comunismo|crítica ao socialismo|gulag|dissiden|defector)\b/i.test(textToCheck)) {
-        isCritiqueOrContext = true;
-      } else {
-        // Só frases claramente de propaganda/apologia (não “ambientado na URSS”)
-        const propRe = /\b(propaganda comunista|propaganda socialista|apologia ao comunismo|apologia ao socialismo|pro-?communist|pro-?socialist|communist propaganda|socialist propaganda|agitprop|filme militante|cinema militante)\b/i;
-        hasCommiePropaganda = propRe.test(textToCheck);
+      if (!hasCommiePropaganda && !isCritiqueOrContext) {
+        const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '')).toLowerCase();
+        if (/\b(anti-?communis|anti-?socialis|crítica ao comunismo|crítica ao socialismo|gulag|dissiden|defector)\b/i.test(textToCheck)) {
+          isCritiqueOrContext = true;
+        } else {
+          const propRe = /\b(propaganda comunista|propaganda socialista|apologia ao comunismo|apologia ao socialismo|pro-?communist|pro-?socialist|communist propaganda|socialist propaganda|agitprop|filme militante|cinema militante)\b/i;
+          hasCommiePropaganda = propRe.test(textToCheck);
+        }
       }
     }
     if (hasCommiePropaganda && !isCritiqueOrContext) {
