@@ -958,8 +958,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  // "v5" no key força recalcular depois da mudança de fórmula
-  const key = 'v5:' + person + ':' + ratedCountFor(person);
+  // "v7" no key força recalcular depois da mudança de fórmula
+  const key = 'v7:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -1542,6 +1542,7 @@ function renderMovieModal(id){
         <p><b>Gêneros:</b> ${(m.genres||[]).join(', ')||'—'}</p>
         <p><b>Duração:</b> ${m.runtimeMin?m.runtimeMin+' min':'—'}</p>
         <p><b>Lançamento:</b> ${m.releaseDate?new Date(m.releaseDate).toLocaleDateString('pt-BR'):'—'}</p>
+        ${m.keywords && m.keywords.length ? `<p><b>Keywords:</b> ${escapeHtml(m.keywords.slice(0,12).join(', '))}${m.keywords.length>12?'…':''}</p>` : `<p class="hint" style="margin:4px 0 0">Keywords: ainda não carregadas — toque em “Verificar novidades” (precisa da chave TMDB).</p>`}
       </div>
       <div class="ratings-row" style="font-size:13px">
         ${ratingChip('IMDb', m.ratings && m.ratings.imdb)} &nbsp; ${ratingChip('Rotten Tomatoes', m.ratings && m.ratings.rtCritics)} &nbsp; ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
@@ -1616,6 +1617,23 @@ function renderMovieModal(id){
       </div>
 
       <div class="vote-editor">
+        <h4>Abandono</h4>
+        <div class="hint" style="margin-top:0">Se você começou e desistiu no meio, isso vira um sinal negativo no algoritmo (mais forte se parou cedo).</div>
+        ${(()=>{
+          const ab = m.abandonedBy && m.abandonedBy[state.me];
+          if(ab){
+            return `<div class="hint" style="margin:8px 0">Você marcou abandono em ${new Date(ab.at).toLocaleDateString('pt-BR')}${ab.pctWatched!=null?' · ~'+ab.pctWatched+'% assistido':''}.</div>
+            <button class="btn btn-ghost btn-block" onclick="__clearAbandon('${m.id}')">Desfazer abandono</button>`;
+          }
+          const seriesPct = (m.type==='series') ? seriesProgressPct(m, state.me) : null;
+          return `
+          <label>Quanto % você chegou a assistir? (opcional)</label>
+          <input type="number" min="1" max="99" id="abandon-pct" value="${seriesPct != null ? seriesPct : 25}" placeholder="ex: 20">
+          <button class="btn btn-ghost btn-block" style="margin-top:8px;border-color:var(--dislike);color:var(--dislike)" onclick="__markAbandon('${m.id}')">⏹ Marcar que desisti / abandonei</button>`;
+        })()}
+      </div>
+
+      <div class="vote-editor">
         <h4>Seu voto (${state.me})</h4>
         <div class="like-toggle">
           <button id="btn-like" class="${(normalizeLiked(myVote.liked) || classifyByScore(myVote.score ?? 5))==='like'?'on-like':''}" onclick="__setLiked('like')">👍 Gostei</button>
@@ -1686,10 +1704,41 @@ function renderMovieModal(id){
     if(!movie) return;
     if(!movie.checkins) movie.checkins = {};
     movie.checkins[state.me] = movie.checkins[state.me] ? null : new Date().toISOString();
-    // Atualiza a tela IMEDIATAMENTE (acaba com a lentidão)
+    // Se marcou assistido completo, remove abandono
+    if(movie.checkins[state.me] && movie.abandonedBy && movie.abandonedBy[state.me]){
+      delete movie.abandonedBy[state.me];
+    }
     render();
-    // Salva no banco de dados em segundo plano
     fbSaveMovie(movie).catch(e => console.error("Erro ao salvar check-in:", e));
+  };
+  window.__markAbandon = (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie) return;
+    let pct = 25;
+    const inp = document.getElementById('abandon-pct');
+    if(inp && inp.value !== ''){
+      const n = parseInt(inp.value);
+      if(!isNaN(n)) pct = Math.max(1, Math.min(99, n));
+    } else if(movie.type==='series'){
+      const sp = seriesProgressPct(movie, state.me);
+      if(sp != null) pct = Math.max(1, Math.min(99, sp));
+    }
+    if(!movie.abandonedBy) movie.abandonedBy = {};
+    movie.abandonedBy[state.me] = { at: new Date().toISOString(), pctWatched: pct };
+    // Abandonar não conta como assistido completo
+    if(movie.checkins && movie.checkins[state.me]) movie.checkins[state.me] = null;
+    // Limpa cache de recomendação
+    _recPctCache = { key: '', map: new Map() };
+    render();
+    fbSaveMovie(movie).catch(e => console.error("Erro ao salvar abandono:", e));
+  };
+  window.__clearAbandon = (id)=>{
+    const movie = state.movies.find(x=>x.id===id);
+    if(!movie || !movie.abandonedBy) return;
+    delete movie.abandonedBy[state.me];
+    _recPctCache = { key: '', map: new Map() };
+    render();
+    fbSaveMovie(movie).catch(e => console.error("Erro ao limpar abandono:", e));
   };
   window.__toggleEditRatings = (id)=>{
     const modal = document.querySelector('#movie-overlay .modal');
@@ -2018,21 +2067,52 @@ function renderSettingsModal(){
       if(raw) processedIds = new Set(JSON.parse(raw));
     }catch(e){}
 
-    let updated = 0, errors = 0, stopped = false, cancelled = false;
-    const failedTitles = [];
     const pool = mode === 'optimized'
       ? state.movies.filter(needsFrequentUpdate)
       : state.movies.slice();
+
+    // Se existe progresso incompleto, pergunta o que fazer
+    if(processedIds.size > 0){
+      const remaining = pool.filter(m=>!processedIds.has(m.id)).length;
+      if(remaining > 0){
+        const choice = await new Promise(resolve=>{
+          msgEl.innerHTML = `
+            <div class="hint">Há uma atualização incompleta neste modo:<br>
+              <b style="color:var(--cream)">${processedIds.size}</b> já processados · faltam cerca de <b style="color:var(--cream)">${remaining}</b>.</div>
+            <div class="field-inline" style="margin-top:10px;gap:8px">
+              <button class="btn btn-gold btn-sm" style="flex:1" id="upd-continue">▶ Continuar de onde parou</button>
+              <button class="btn btn-ghost btn-sm" style="flex:1" id="upd-restart">↺ Recomeçar do zero</button>
+            </div>
+            <button class="btn btn-ghost btn-sm" style="margin-top:8px;width:100%" id="upd-cancel">Cancelar</button>`;
+          document.getElementById('upd-continue').onclick = ()=>resolve('continue');
+          document.getElementById('upd-restart').onclick = ()=>resolve('restart');
+          document.getElementById('upd-cancel').onclick = ()=>resolve('cancel');
+        });
+        if(choice === 'cancel'){
+          msgEl.innerHTML = `<div class="hint">Atualização cancelada.</div>`;
+          return;
+        }
+        if(choice === 'restart'){
+          processedIds = new Set();
+          try{ localStorage.removeItem(progressKey); }catch(e){}
+        }
+      } else {
+        // Progresso antigo já cobre tudo — limpa e recomeça
+        processedIds = new Set();
+        try{ localStorage.removeItem(progressKey); }catch(e){}
+      }
+    }
+
+    let updated = 0, errors = 0, stopped = false, cancelled = false;
+    const failedTitles = [];
     const toProcess = pool.filter(m=>!processedIds.has(m.id));
     const alreadyDone = processedIds.size;
     if(mode === 'optimized'){
-      msgEl.innerHTML = `<div class="hint">Modo otimizado: ${pool.length} títulos elegíveis (séries ativas + filmes ≤ 1 ano).</div>`;
-      await new Promise(res=>setTimeout(res, 400));
-    }
-
-    if(alreadyDone > 0 && toProcess.length > 0){
-      msgEl.innerHTML = `<div class="hint">Retomando de onde parou: ${alreadyDone} já feitos antes, faltam ${toProcess.length}.</div>`;
-      await new Promise(res=>setTimeout(res, 900));
+      msgEl.innerHTML = `<div class="hint">Modo otimizado: ${pool.length} títulos elegíveis (séries ativas + filmes ≤ 1 ano). Processando ${toProcess.length}…</div>`;
+      await new Promise(res=>setTimeout(res, 500));
+    } else if(alreadyDone > 0){
+      msgEl.innerHTML = `<div class="hint">Continuando: ${alreadyDone} já feitos, faltam ${toProcess.length}.</div>`;
+      await new Promise(res=>setTimeout(res, 500));
     }
 
     try{
@@ -2245,7 +2325,7 @@ function buildTasteProfile(person, excludeId){
 }
 
 function buildTasteProfileRaw(person, excludeId){
-  const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{}, runtime:{} };
+  const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{}, genreDecadeCountry:{}, keyword:{}, runtime:{} };
   let count = 0;
   function bump(map, key, w){
     if(!map[key]) map[key] = { sum:0, n:0 };
@@ -2261,6 +2341,7 @@ function buildTasteProfileRaw(person, excludeId){
         bump(maps.genreCountry, g+'|'+c, w);
         const cont = countryToContinent(c);
         if(cont) bump(maps.genreCountry, g+'|cont:'+cont, w);
+        if(decade!=null) bump(maps.genreDecadeCountry, g+'|'+decade+'|'+c, w);
       });
     });
     if(m.director) m.director.split(',').map(s=>s.trim()).forEach(d=>bump(maps.director, d, w));
@@ -2269,6 +2350,10 @@ function buildTasteProfileRaw(person, excludeId){
     (m.countries||[]).forEach(c=>bump(maps.country, c, w));
     if(decade!=null) bump(maps.decade, decade, w);
     if(m.production) bump(maps.studio, m.production, w);
+    (m.keywords||[]).forEach(k=>{
+      const kk = String(k).toLowerCase().trim();
+      if(kk) bump(maps.keyword, kk, w);
+    });
     const rb = runtimeBucket(m.runtimeMin);
     if(rb) bump(maps.runtime, rb, w);
   }
@@ -2278,8 +2363,13 @@ function buildTasteProfileRaw(person, excludeId){
     if(v && v.score!=null){
       count++;
       applyMovie(m, v.score - 5.5);
+    } else if(m.abandonedBy && m.abandonedBy[person]){
+      // Abandono = proxy negativo (confiança ~70% de uma nota explícita)
+      const pct = m.abandonedBy[person].pctWatched;
+      const eq = abandonToScore(pct);
+      count++;
+      applyMovie(m, (eq - 5.5) * 0.7);
     } else if(m.dismissedBy && m.dismissedBy.includes(person)){
-      // "Não me interessa" conta como um sinal negativo claro, mesmo sem nota formal
       applyMovie(m, -2.5);
     }
   });
@@ -2356,44 +2446,83 @@ function crossUserAffinityFor(personA, personB, movie){
   return weightedSum / totalWeight;
 }
 
-// Peso mínimo de avaliações para uma "chave" (gênero/ator/etc) começar a contar com força.
-// Um único filme não deve empurrar a % pra cima ou pra baixo sozinho.
-const SHRINK_K = 3;
-function shrunkWeight(entry){
+// Shrinkage por feature: k menor = confia mais rápido; k maior = exige mais repetições.
+// Diretor/atores = sinal causal forte; estúdio/roteirista = mais ruidoso.
+const SHRINK_K_BY_FEATURE = {
+  director: 2.0,
+  actor: 2.5,
+  writer: 5.0,
+  studio: 6.0,
+  country: 3.0,
+  decade: 3.0,
+  genreDecade: 3.5,
+  genreCountry: 3.5,
+  genreDecadeCountry: 4.0,
+  keyword: 4.0, // subgênero/tema (slasher, time travel…) — precisa de algumas repetições
+  default: 3.0
+};
+function shrunkWeight(entry, feature){
   if(!entry || entry.n===0) return 0;
+  const k = SHRINK_K_BY_FEATURE[feature] ?? SHRINK_K_BY_FEATURE.default;
   const avg = entry.sum / entry.n;
-  const confidence = entry.n / (entry.n + SHRINK_K);
+  const confidence = entry.n / (entry.n + k);
   return avg * confidence;
 }
 
-// Sinal "cru" — só os padrões de gosto (gêneros, pessoas, país, década, produtora, interações).
-// Usado tanto pra prever quanto pra o backtest de auto-validação.
+// Abandono → nota equivalente (proxy). Quanto mais cedo parou, mais negativo.
+// 15% ≈ 2,3 · 60% ≈ 4,5 · 90% ≈ 6,0
+function abandonToScore(pctWatched){
+  const p = Math.max(0, Math.min(100, pctWatched == null ? 25 : Number(pctWatched))) / 100;
+  return 1.5 + p * 5;
+}
+// Progresso de série a partir de episódios marcados
+function seriesProgressPct(movie, person){
+  const seasons = movie.seasons || [];
+  let total = 0;
+  seasons.forEach(s=>{ total += (s.episodeCount || 0); });
+  if(total <= 0) return null;
+  const votes = (movie.episodeVotes && movie.episodeVotes[person]) || {};
+  let watched = 0;
+  Object.keys(votes).forEach(k=>{ if(votes[k] && votes[k].watched) watched++; });
+  return Math.round(100 * watched / total);
+}
+
+// Sinal "cru" — padrões de gosto (pessoas, país, década, combinações de gênero…).
 function rawTasteSignal(movie, maps){
   let raw = 0, maxPossible = 0.0001;
-  function add(map, keys, weightMul){
+  function add(map, keys, weightMul, feature){
     keys.forEach(k=>{
       const entry = map[k];
-      if(!entry || entry.n===0) return; // sem nenhum dado sobre essa característica: não conta a favor nem contra
-      const eff = shrunkWeight(entry);
+      if(!entry || entry.n===0) return;
+      const eff = shrunkWeight(entry, feature);
       raw += eff*weightMul;
       maxPossible += (Math.abs(eff)+1)*weightMul;
     });
   }
   const decade = movie.year ? Math.floor(parseInt(movie.year)/10)*10 : null;
-  // Gênero sozinho = 0 (filtro na UI). Gênero+década/país/continente = sim.
-  add(maps.genre, movie.genres||[], 0);
-  if(movie.director) add(maps.director, movie.director.split(',').map(s=>s.trim()), 1.4);
-  if(movie.writer) add(maps.writer, movie.writer.split(',').map(s=>s.trim()), 1.0);
-  if(movie.actors) add(maps.actor, movie.actors.split(',').map(s=>s.trim()), 1.2);
-  add(maps.country, movie.countries||[], 0.8);
-  if(decade!=null) add(maps.decade, [decade], 0.8);
-  if(movie.production) add(maps.studio, [movie.production], 0.7);
-  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 1.3);
+  // Gênero sozinho = 0. Combinações com década/país/continente = sim.
+  add(maps.genre, movie.genres||[], 0, 'default');
+  if(movie.director) add(maps.director, movie.director.split(',').map(s=>s.trim()), 1.4, 'director');
+  if(movie.writer) add(maps.writer, movie.writer.split(',').map(s=>s.trim()), 1.0, 'writer');
+  if(movie.actors) add(maps.actor, movie.actors.split(',').map(s=>s.trim()), 1.2, 'actor');
+  add(maps.country, movie.countries||[], 0.8, 'country');
+  if(decade!=null) add(maps.decade, [decade], 0.8, 'decade');
+  if(movie.production) add(maps.studio, [movie.production], 0.7, 'studio');
+  if(decade!=null) add(maps.genreDecade, (movie.genres||[]).map(g=>g+'|'+decade), 1.3, 'genreDecade');
   (movie.countries||[]).forEach(c=>{
-    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1);
+    add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|'+c), 1.1, 'genreCountry');
     const cont = countryToContinent(c);
-    if(cont) add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|cont:'+cont), 1.0);
+    if(cont) add(maps.genreCountry, (movie.genres||[]).map(g=>g+'|cont:'+cont), 1.0, 'genreCountry');
+    // Tríplice: gênero + década + país (ex.: terror americano anos 70)
+    if(decade!=null){
+      add(maps.genreDecadeCountry, (movie.genres||[]).map(g=>g+'|'+decade+'|'+c), 1.4, 'genreDecadeCountry');
+    }
   });
+  // Keywords TMDB ≈ tags de subgênero/tema do IMDb (slasher, based on novel, time travel…)
+  if(movie.keywords && movie.keywords.length){
+    const kws = movie.keywords.map(k=>String(k).toLowerCase().trim()).filter(Boolean);
+    add(maps.keyword, kws, 1.15, 'keyword');
+  }
   return { raw, maxPossible };
 }
 
@@ -2519,19 +2648,23 @@ function estimateAffinity(movie, person){
   const rtVal = ratings.rtCritics;
   const metaVal = ratings.metacritic;
 
-  // Qualidade externa com pesos separados:
-  // IMDb tem o DOBRO do peso base do Metacritic.
-  // RT fica no meio. Volume de votos do IMDb ainda aumenta a confiança.
+  // Qualidade externa em 2 camadas (evita voto duplo da crítica):
+  // 1) RT + Metacritic → uma "nota de crítica"
+  // 2) essa crítica + IMDb (público), com IMDb pesando o dobro
   let extScore = null;
   {
+    let criticVals = [];
+    if (rtVal != null) criticVals.push(rtVal);
+    if (metaVal != null) criticVals.push(metaVal);
+    const criticAvg = criticVals.length
+      ? criticVals.reduce((a,b)=>a+b,0) / criticVals.length
+      : null;
+
     let sum = 0, wSum = 0;
-    // Metacritic peso base = 1 → IMDb peso base = 2
-    const META_W = 1.0;
-    const IMDB_BASE_W = META_W * 2; // dobro do Metacritic
-    const RT_W = 1.2;
+    const CRITIC_W = 1.0;
+    const IMDB_BASE_W = 2.0; // dobro da crítica agregada
 
     if (imdbVal != null) {
-      // Volume de votos reforça o IMDb (sem deixar o piso abaixo de 2× Meta)
       let imdbW = IMDB_BASE_W;
       if (imdbVotes != null) {
         imdbW = Math.min(4.0, IMDB_BASE_W + Math.log10(imdbVotes + 1) / 3);
@@ -2539,18 +2672,11 @@ function estimateAffinity(movie, person){
       sum += imdbVal * imdbW;
       wSum += imdbW;
     }
-    if (metaVal != null) {
-      let metaW = META_W;
-      // Se discordar forte do IMDb, reduz um pouco
-      if (imdbVal != null && Math.abs(imdbVal - metaVal) > 1.5) metaW *= 0.5;
-      sum += metaVal * metaW;
-      wSum += metaW;
-    }
-    if (rtVal != null) {
-      let rtW = RT_W;
-      if (imdbVal != null && Math.abs(imdbVal - rtVal) > 1.5) rtW *= 0.5;
-      sum += rtVal * rtW;
-      wSum += rtW;
+    if (criticAvg != null) {
+      let cW = CRITIC_W;
+      if (imdbVal != null && Math.abs(imdbVal - criticAvg) > 1.5) cW *= 0.5;
+      sum += criticAvg * cW;
+      wSum += cW;
     }
     if (wSum > 0) extScore = sum / wSum;
   }
@@ -2599,20 +2725,27 @@ function estimateAffinity(movie, person){
     qualityPct = 50 + (qualityPct - 50) * qualityConf;
   }
 
-  // Evidência cheia → 35% gosto / 65% qualidade; fraca → 15% gosto / 85% qualidade.
-  // Sem IMDb: mantém piso no gosto para não deixar RT isolado dominar.
-  let tasteWeight = 0.15 + 0.20 * tasteEvidence;
+  // Curva contínua (sigmoide) do peso gosto × evidência — sem degraus.
+  // Evidência 0 → ~15% gosto; evidência 1 → ~35% gosto.
+  // A confiança do gosto já multiplica: sinal fraco pesa menos sozinho.
+  function sigmoid01(x){
+    // centra em 0.5, suave
+    return 1 / (1 + Math.exp(-8 * (x - 0.5)));
+  }
+  const PesoMin = 0.15, PesoMax = 0.35;
+  let tasteWeight = PesoMin + (PesoMax - PesoMin) * sigmoid01(tasteEvidence);
+  // Peso do gosto também escala com a confiança do modelo (corr)
+  tasteWeight *= Math.max(0.55, fatorConfianca);
   if (imdbVal == null) {
-    tasteWeight = Math.max(tasteWeight, 0.35);
+    // Sem IMDb: não deixa crítica isolada dominar
+    tasteWeight = Math.max(tasteWeight, 0.30);
   }
-  // Nota externa sólida (≥ 7): não deixa gosto só levemente negativo afundar o filme
-  if (extScore != null && extScore >= 7.0 && tastePct < 50) {
-    tasteWeight = Math.min(tasteWeight, 0.25);
-  }
+  // Garante faixa útil
+  tasteWeight = Math.max(0.10, Math.min(0.45, tasteWeight));
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
 
-  // Esticamento ASSIMÉTRICO (v4)
+  // Esticamento ASSIMÉTRICO
   if (pctFinal >= 50) {
     pctFinal = 50 + (pctFinal - 50) * 2.0;
   } else {
@@ -2843,7 +2976,7 @@ function explainRecommendation(movie, person){
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
   const evid = Math.max(0, Math.min(1, maxPossible / 12));
-  down.push(`🔧 Diagnóstico v5: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  down.push(`🔧 Diagnóstico v7: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
