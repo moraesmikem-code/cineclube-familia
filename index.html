@@ -393,26 +393,91 @@ const LIST_TYPES = {
     desc:'Guarde aqui pra pesquisar ou se informar melhor depois.', addLabel:'📝 Adicionar aos Anotados', addedLabel:'📝 Está nos seus Anotados · toque para remover' },
 };
 
+const MOVIES_CACHE_KEY = 'cineclube-movies-cache-v1';
+
+function loadMoviesCache(){
+  try{
+    const raw = localStorage.getItem(MOVIES_CACHE_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(parsed && Array.isArray(parsed.movies) && parsed.movies.length) return parsed.movies;
+  }catch(e){ /* quota / parse */ }
+  return null;
+}
+function saveMoviesCache(movies){
+  try{
+    localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies }));
+  }catch(e){
+    // Se estourar a cota (~5MB), grava versão enxuta (sem sinopse/keywords/seasons)
+    try{
+      const slim = movies.map(m=>({
+        id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
+        titleEn:m.titleEn, year:m.year, poster:m.poster, director:m.director, writer:m.writer,
+        actors:m.actors, genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
+        countries:m.countries, languages:m.languages, primaryLanguage:m.primaryLanguage,
+        production:m.production, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
+        addedAt:m.addedAt, dismissedBy:m.dismissedBy
+      }));
+      localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim, slim:true }));
+    }catch(e2){ /* desiste do cache */ }
+  }
+}
+
 async function init(){
-  const fam = await sGet('family-config', true);
-  const key = await sGet('omdb-key', true);
-  const tmdbKey = await sGet('tmdb-key', true);
-  const lastGeneralUpdate = await sGet('last-general-update', true);
-  const updateErrorLogRaw = await sGet('update-error-log', true);
-  const importErrorLogRaw = await sGet('import-error-log', true);
-  const watchlists = await sGet('watchlists-v1', true);
-  const watching = await sGet('watching-v1', true);
-  const noted = await sGet('noted-v1', true);
-  const me = await sGet('my-identity', false);
+  // Spinner imediato (antes de qualquer await)
+  state.booted = false;
+  render();
+
+  // Configs em paralelo (antes eram ~10 awaits em sequência)
+  const [
+    fam, key, tmdbKey, lastGeneralUpdate,
+    updateErrorLogRaw, importErrorLogRaw,
+    watchlists, watching, noted, me
+  ] = await Promise.all([
+    sGet('family-config', true),
+    sGet('omdb-key', true),
+    sGet('tmdb-key', true),
+    sGet('last-general-update', true),
+    sGet('update-error-log', true),
+    sGet('import-error-log', true),
+    sGet('watchlists-v1', true),
+    sGet('watching-v1', true),
+    sGet('noted-v1', true),
+    sGet('my-identity', false)
+  ]);
+
   state.family = fam ? JSON.parse(fam) : null;
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
   state.lastGeneralUpdateAt = lastGeneralUpdate || null;
   try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
   try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
+  state.watchlists = watchlists ? JSON.parse(watchlists) : {};
+  state.lists = {
+    priorities: state.watchlists,
+    watching: watching ? JSON.parse(watching) : {},
+    noted: noted ? JSON.parse(noted) : {}
+  };
+  state.me = me || null;
 
-  // Filmes agora vivem numa coleção (1 documento por filme, sem limite de 1MB no catálogo todo).
-  // Se a coleção ainda estiver vazia, tenta migrar do formato antigo (1 documento só com tudo).
+  // 1) Cache local → abre o app na hora
+  const cached = loadMoviesCache();
+  if(cached && cached.length){
+    state.movies = cached;
+    state.booted = true;
+    render();
+    // 2) Firestore em background (atualiza sem travar a tela)
+    fbGetAllMovies().then(movies=>{
+      if(movies && movies.length){
+        state.movies = movies;
+        saveMoviesCache(movies);
+        if(!state.modalMovie && !state.addFlow && !state.settingsOpen) render();
+      }
+    }).catch(e=>console.error('erro ao atualizar filmes em background', e));
+    return;
+  }
+
+  // Sem cache: carrega do Firestore (1ª abertura ou cache limpo)
   let movies = [];
   try{
     movies = await fbGetAllMovies();
@@ -424,20 +489,13 @@ async function init(){
         const legacyMovies = JSON.parse(legacyJson);
         if(legacyMovies.length){
           movies = legacyMovies;
-          await fbSaveMoviesBatch(movies); // migra pra coleção nova
+          await fbSaveMoviesBatch(movies);
         }
       }
     }catch(e){ console.error('erro na migração', e); }
   }
   state.movies = movies;
-
-  state.watchlists = watchlists ? JSON.parse(watchlists) : {};
-  state.lists = {
-    priorities: state.watchlists,
-    watching: watching ? JSON.parse(watching) : {},
-    noted: noted ? JSON.parse(noted) : {}
-  };
-  state.me = me || null;
+  if(movies.length) saveMoviesCache(movies);
   state.booted = true;
   render();
 }
@@ -833,20 +891,120 @@ function getFilteredSorted(){
   return sortMovieList(list, state.sortField, state.sortDir);
 }
 
+function getFilteredListOnly(){
+  // Mesmos filtros de getFilteredSorted, sem ordenar
+  const prevField = state.sortField;
+  const prevDir = state.sortDir;
+  state.sortField = 'added'; // sort barato só para reutilizar o filtro
+  state.sortDir = 'desc';
+  // Reimplementa só o filtro (cópia leve)
+  let list = state.movies.slice();
+  list = list.filter(m => !(m.hiddenBy && m.hiddenBy.includes(state.me)));
+  const f = state.filters;
+  if(state.search.trim()){
+    const q = state.search.trim().toLowerCase();
+    list = list.filter(m => displayTitle(m).toLowerCase().includes(q));
+  }
+  if(f.mediaType !== 'all') list = list.filter(m => (m.type || 'movie') === f.mediaType);
+  if(f.decade !== 'all') list = list.filter(m => { const y=parseInt(m.year); return !isNaN(y) && Math.floor(y/10)*10 === Number(f.decade); });
+  if(f.continent !== 'all') list = list.filter(m => (m.countries||[]).some(c => countryToContinent(c) === f.continent));
+  if(f.language !== 'all') list = list.filter(m => (m.primaryLanguage || (m.languages||[])[0]) === f.language);
+  if(f.genres.length) list = list.filter(m => (m.genres||[]).some(g => f.genres.includes(g)));
+  if(f.status !== 'all'){
+    const who = f.statusWho || 'all';
+    const wantWatched = f.status === 'watched';
+    list = list.filter(m=>{
+      const checked = (name) => !!(m.checkins && m.checkins[name]);
+      if(who === 'all'){
+        return wantWatched ? state.family.members.every(checked) : state.family.members.every(name=>!checked(name));
+      }
+      return wantWatched ? checked(who) : !checked(who);
+    });
+  }
+  if(f.ratingOn && f.ratingSource){
+    list = list.filter(m=>{
+      let val = null;
+      if(f.ratingSource === 'avg') val = familyAvg(m);
+      else if (f.ratingSource === 'avgExternal') {
+        let sum = 0, count = 0;
+        if (m.ratings && m.ratings.imdb != null) { sum += m.ratings.imdb; count++; }
+        if (m.ratings && m.ratings.rtCritics != null) { sum += m.ratings.rtCritics; count++; }
+        if (m.ratings && m.ratings.metacritic != null) { sum += m.ratings.metacritic; count++; }
+        if (count > 0) val = sum / count;
+      } else if(f.ratingSource.startsWith('member:')){
+        const name = f.ratingSource.split(':')[1];
+        val = m.votes[name] ? m.votes[name].score : null;
+      } else {
+        val = m.ratings ? m.ratings[f.ratingSource] : null;
+      }
+      if(val==null) return false;
+      return Math.floor(val) === Number(f.ratingValue);
+    });
+  }
+  state.sortField = prevField;
+  state.sortDir = prevDir;
+  return list;
+}
+
+// Cache de % de recomendação: sobrevive entre ordenações até o usuário avaliar mais filmes
+let _recPctCache = { key: '', map: new Map() };
+
+function ratedCountFor(person){
+  let n = 0;
+  for(let i=0;i<state.movies.length;i++){
+    const v = state.movies[i].votes && state.movies[i].votes[person];
+    if(v && v.score != null) n++;
+  }
+  return n;
+}
+function ensureRecCacheBucket(person){
+  const key = person + ':' + ratedCountFor(person);
+  if(_recPctCache.key !== key){
+    _recPctCache = { key, map: new Map() };
+  }
+  return _recPctCache.map;
+}
+function getAffinityPct(movie, person){
+  const map = ensureRecCacheBucket(person);
+  if(map.has(movie.id)) return map.get(movie.id);
+  let pct = -1;
+  try{
+    const rec = estimateAffinity(movie, person);
+    if(rec && rec.ready && rec.pct != null) pct = rec.pct;
+  }catch(e){ pct = -1; }
+  map.set(movie.id, pct);
+  return pct;
+}
+// Preenche o cache em fatias para não travar a UI
+async function warmRecCache(list, person, onProgress){
+  const map = ensureRecCacheBucket(person);
+  const missing = [];
+  for(let i=0;i<list.length;i++){
+    if(!map.has(list[i].id)) missing.push(list[i]);
+  }
+  if(missing.length === 0){
+    if(onProgress) onProgress(0, 0);
+    return;
+  }
+  const CHUNK = 120;
+  for(let i=0;i<missing.length;i+=CHUNK){
+    const end = Math.min(i+CHUNK, missing.length);
+    for(let j=i;j<end;j++) getAffinityPct(missing[j], person);
+    if(onProgress) onProgress(end, missing.length);
+    // Cede o thread para a UI respirar
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
 function sortMovieList(list, field, dir){
   const dirMul = dir === 'asc' ? 1 : -1;
 
-  // Pré-calcula recomendações UMA vez (evita travar com milhares de títulos)
+  // Usa cache de recomendações (já aquecido ou sob demanda)
   let recMap = null;
   if(field === 'recommendation'){
-    recMap = new Map();
+    recMap = ensureRecCacheBucket(state.me);
     for(const m of list){
-      try{
-        const rec = estimateAffinity(m, state.me);
-        recMap.set(m.id, (rec && rec.ready && rec.pct != null) ? rec.pct : -1);
-      }catch(e){
-        recMap.set(m.id, -1);
-      }
+      if(!recMap.has(m.id)) getAffinityPct(m, state.me);
     }
   }
 
@@ -918,7 +1076,13 @@ function removeOverlays(){
 
 function render(){
   removeOverlays();
-  if(!state.booted){ app.innerHTML = `<div class="center-screen"><div class="loading-spin"></div></div>`; return; }
+  if(!state.booted){
+    app.innerHTML = `<div class="center-screen" style="align-items:center;text-align:center;gap:14px">
+      <div class="loading-spin"></div>
+      <div style="color:var(--muted);font-size:14px;margin-top:12px">Carregando catálogo…</div>
+    </div>`;
+    return;
+  }
   if(!state.family){ renderFamilySetup(); return; }
   if(!state.me){ renderIdentityPicker(); return; }
   renderMain();
@@ -1113,7 +1277,32 @@ function renderMain(){
     const el = document.getElementById('catalog');
     if(el) el.innerHTML = catalogListHtml(getFilteredSorted());
   };
-  window.__setSort = (v)=>{ state.sortField=v; render(); };
+  window.__setSort = async (v)=>{
+    state.sortField = v;
+    if(v === 'recommendation'){
+      const list = getFilteredListOnly();
+      const map = ensureRecCacheBucket(state.me);
+      let missing = 0;
+      for(let i=0;i<list.length;i++) if(!map.has(list[i].id)) missing++;
+      if(missing > 80){
+        // Mostra progresso em vez de travar
+        const cat = document.getElementById('catalog');
+        if(cat){
+          cat.innerHTML = `<div class="empty" style="padding:24px 12px">
+            <div class="loading-spin" style="margin:0 auto 12px"></div>
+            <div id="rec-progress-msg" style="color:var(--muted);font-size:14px">Calculando recomendações… 0/${missing}</div>
+          </div>`;
+        }
+        await warmRecCache(list, state.me, (done, total)=>{
+          const el = document.getElementById('rec-progress-msg');
+          if(el) el.textContent = total ? `Calculando recomendações… ${done}/${total}` : 'Pronto';
+        });
+      } else if(missing > 0){
+        await warmRecCache(list, state.me, null);
+      }
+    }
+    render();
+  };
   window.__setDir = (v)=>{ state.sortDir=v; render(); };
   window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; render(); };
   window.__setStatusWho = (v)=>{ state.filters.statusWho=v; render(); };
@@ -1173,7 +1362,7 @@ function renderCard(m){
         ${ratingChip('IMDb', m.ratings && m.ratings.imdb)}
         ${ratingChip('RT', m.ratings && m.ratings.rtCritics)}
         ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
-        ${(()=>{ const myV=m.votes[state.me]; if(myV && myV.score!=null) return ''; const r=estimateAffinity(m,state.me); return r.ready ? `<span>Recomendação: <b style="color:var(--gold)">${r.pct}%</b></span>` : ''; })()}
+        ${(()=>{ const myV=m.votes[state.me]; if(myV && myV.score!=null) return ''; const pct=getAffinityPct(m,state.me); return pct>=0 ? `<span>Recomendação: <b style="color:var(--gold)">${pct}%</b></span>` : ''; })()}
       </div>
       ${checkinHtml}
       <div class="perf"></div>
