@@ -2645,6 +2645,24 @@ const PHILOSOPHY_KW_LIST = [
   'solipsism','ontology','epistemology','stoicism','absurdism','absurdist',
   'meaning of life','human condition','philosophical drama'
 ];
+// Propaganda favorável a comunismo/socialismo — −20%
+// NÃO inclui só ambientação histórica, crítica ao regime ou personagem comunista neutro.
+const COMMIE_PROPAGANDA_KW_LIST = [
+  'communist propaganda','socialist propaganda','marxist propaganda',
+  'pro-communist','pro-communism','pro-socialist','pro-socialism',
+  'revolutionary propaganda','soviet propaganda','maoist propaganda',
+  'glorification of communism','glorification of socialism',
+  'propaganda comunista','propaganda socialista','apologia ao comunismo',
+  'apologia ao socialismo','cinema militante','filme militante',
+  'agitprop','agit-prop','socialist realism film'
+];
+// Se estas keywords aparecerem, trata como crítica/contexto — NÃO penaliza
+const COMMIE_CRITIQUE_KW_LIST = [
+  'anti-communist','anti-communism','critique of communism','critique of socialism',
+  'anti-soviet','gulag','stalinist terror','cultural revolution horror',
+  'escape from communism','defector','dissident','iron curtain escape',
+  'crítica ao comunismo','crítica ao socialismo','anticomunista'
+];
 
 function estimateAffinity(movie, person){
   try {
@@ -2873,6 +2891,33 @@ function estimateAffinity(movie, person){
     }
     if (hasPhilosophyTheme) {
       pctFinal = pctFinal * 0.9; // diminui 10%
+    }
+  }
+
+  // Propaganda pró-comunismo/socialismo: −20% (não pune crítica nem só ambientação)
+  {
+    let hasCommiePropaganda = false;
+    let isCritiqueOrContext = false;
+    if (movie.keywords && movie.keywords.length) {
+      const kwSet = new Set(movie.keywords.map(k => String(k).toLowerCase()));
+      isCritiqueOrContext = COMMIE_CRITIQUE_KW_LIST.some(k => kwSet.has(k));
+      if (!isCritiqueOrContext) {
+        hasCommiePropaganda = COMMIE_PROPAGANDA_KW_LIST.some(k => kwSet.has(k));
+      }
+    }
+    if (!hasCommiePropaganda && !isCritiqueOrContext) {
+      const textToCheck = ((movie.synopsisPt || '') + ' ' + (movie.plot || '')).toLowerCase();
+      // Crítica explícita → não penaliza
+      if (/\b(anti-?communis|anti-?socialis|crítica ao comunismo|crítica ao socialismo|gulag|dissiden|defector)\b/i.test(textToCheck)) {
+        isCritiqueOrContext = true;
+      } else {
+        // Só frases claramente de propaganda/apologia (não “ambientado na URSS”)
+        const propRe = /\b(propaganda comunista|propaganda socialista|apologia ao comunismo|apologia ao socialismo|pro-?communist|pro-?socialist|communist propaganda|socialist propaganda|agitprop|filme militante|cinema militante)\b/i;
+        hasCommiePropaganda = propRe.test(textToCheck);
+      }
+    }
+    if (hasCommiePropaganda && !isCritiqueOrContext) {
+      pctFinal = pctFinal * 0.8; // diminui 20%
     }
   }
 
