@@ -1448,6 +1448,90 @@ function posterUrl(m){
   return (m && (m.posterCustom || m.poster)) || '';
 }
 
+/** Atualiza modal aberto e card do catálogo sem redesenhar tudo */
+function patchVoteUI(movie, person){
+  if(!movie) return;
+  const v = movie.votes && movie.votes[person];
+  // --- Modal: votos da família ---
+  const allVotes = document.querySelector('#movie-overlay .all-votes');
+  if(allVotes && state.family && state.family.members){
+    const lines = state.family.members.map(name=>{
+      const vv = movie.votes[name];
+      const has = vv && (vv.score!=null || vv.liked!=null);
+      const icon = !has ? '<span class="vote-empty">sem voto ainda</span>' :
+        `${likedIcon(vv.liked)} ${vv.score!=null?'<b style="color:var(--gold)">'+vv.score+'/10</b>':''}`;
+      return `<div class="vote-line"><span>${name}</span><span>${icon}</span></div>`;
+    }).join('');
+    const avg = familyAvg(movie);
+    allVotes.innerHTML = `
+      <h4 style="color:var(--gold);font-size:16px;margin-bottom:6px">Votos da família</h4>
+      ${lines}
+      <div class="vote-line"><span>Média da família</span><span><b style="color:var(--gold)">${avg ?? '—'}</b></span></div>`;
+  }
+  // --- Modal: check-in badges (se existirem) ---
+  const checkinRow = document.querySelector('#movie-overlay .checkin-row');
+  if(checkinRow && state.family){
+    checkinRow.innerHTML = state.family.members.map(name=>{
+      const done = movie.checkins && movie.checkins[name];
+      const mine = name === state.me;
+      return `<div class="checkin-badge ${done?'done':''} ${mine?'mine':''}">${done?'✔':'○'} ${name}</div>`;
+    }).join('');
+  }
+  // --- Card no catálogo (se visível) ---
+  const catalog = document.getElementById('catalog');
+  if(catalog){
+    const tickets = catalog.querySelectorAll('.ticket');
+    tickets.forEach(ticket=>{
+      const onclick = ticket.getAttribute('onclick') || '';
+      if(!onclick.includes(movie.id)) return;
+      // Substitui só a faixa de votos e check-in
+      const votesRow = ticket.querySelector('.votes-row');
+      if(votesRow && state.family){
+        votesRow.innerHTML = state.family.members.map(name=>{
+          const vv = movie.votes[name];
+          const mine = name === state.me;
+          if(!vv || (vv.score==null && vv.liked==null)){
+            return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="vote-empty">sem voto</span></div>`;
+          }
+          const likeIcon = `<span>${likedIcon(vv.liked)}</span>`;
+          const scoreTxt = vv.score!=null ? `<span class="score">${vv.score}</span>` : '';
+          return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span>${likeIcon}${scoreTxt}</div>`;
+        }).join('');
+      }
+      const cRow = ticket.querySelector('.checkin-row');
+      if(cRow && state.family){
+        cRow.innerHTML = state.family.members.map(name=>{
+          const done = movie.checkins && movie.checkins[name];
+          const mine = name === state.me;
+          return `<div class="checkin-badge ${done?'done':''} ${mine?'mine':''}">${done?'✔':'○'} ${name}</div>`;
+        }).join('');
+      }
+      // Atualiza % de recomendação no card se estiver visível
+      const ratingsRow = ticket.querySelector('.ratings-row');
+      if(ratingsRow){
+        const spans = ratingsRow.querySelectorAll('span');
+        spans.forEach(sp=>{
+          if(/Recomendação/i.test(sp.textContent||'')){
+            const pct = getAffinityPct(movie, state.me);
+            sp.innerHTML = pct>=0 ? `Recomendação: <b style="color:var(--gold)">${pct}%</b>` : '';
+          }
+        });
+      }
+    });
+  }
+}
+function showVoteSavedFeedback(){
+  const btn = document.querySelector('#movie-overlay .vote-editor .btn-gold');
+  if(!btn) return;
+  const old = btn.textContent;
+  btn.textContent = '✓ Salvo';
+  btn.disabled = true;
+  setTimeout(()=>{
+    btn.textContent = old || 'Salvar voto';
+    btn.disabled = false;
+  }, 900);
+}
+
 function renderCard(m){
   const genres = (m.genres||[]).slice(0,3);
   const posterHtml = posterUrl(m) ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="">` : `<div class="poster-ph">🎬</div>`;
@@ -2003,16 +2087,20 @@ function renderMovieModal(id){
     const scoreInput = document.getElementById('score-slider').value;
     const score = parseInt(scoreInput);
     m.votes[state.me] = { liked: pendingLiked, score: score };
-    // TRAVA DE SEGURANÇA: Só faz o check-in automático se a nota for maior que zero
     if (!isNaN(score) && score > 0) {
       if (!m.checkins) m.checkins = {};
       if (!m.checkins[state.me]) {
         m.checkins[state.me] = new Date().toISOString();
       }
     }
-    // Atualiza a tela IMEDIATAMENTE
-    render();
-    // Salva no banco de dados em segundo plano
+    // Invalida caches de recomendação
+    try{
+      _profileCache = {};
+      if(typeof _recPctCache !== 'undefined') _recPctCache = { key:null, map:{} };
+    }catch(e){}
+    // Só modal + card — sem render() do catálogo
+    patchVoteUI(m, state.me);
+    showVoteSavedFeedback();
     fbSaveMovie(m).catch(e => console.error("Erro ao salvar voto:", e));
   };
   window.__deleteMovie = async (id)=>{
