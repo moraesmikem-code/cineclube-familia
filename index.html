@@ -213,7 +213,7 @@
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, collection, getDocs, deleteDoc, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+import { getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs, query, where, deleteDoc, writeBatch, arrayUnion } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCT8ESebwZWZVWfk7CT1Xk3NlG3b92wqcI",
@@ -261,20 +261,49 @@ async function fbGetAllMovies(){
   const snap = await getDocs(collection(db,'movies-items'));
   return snap.docs.map(d=>d.data());
 }
+// Só os filmes cujo documento mudou depois de `sinceTs` (ms epoch) — usado pela
+// sincronização incremental pra não baixar o catálogo inteiro toda vez.
+async function fbGetChangedMovies(sinceTs){
+  const q = query(collection(db,'movies-items'), where('updatedAt', '>', sinceTs));
+  const snap = await getDocs(q);
+  return snap.docs.map(d=>d.data());
+}
 async function fbSaveMovie(movie){
+  movie.updatedAt = Date.now(); // marca de tempo usada pra sincronização incremental
   await setDoc(doc(db,'movies-items',movie.id), movie);
 }
 async function fbDeleteMovie(movieId){
   await deleteDoc(doc(db,'movies-items',movieId));
+  try{ await fbRecordDeletion(movieId); }catch(e){ console.error('erro ao registrar exclusão p/ sync', e); }
 }
 async function fbSaveMoviesBatch(movies){
   const chunkSize = 450; // limite do Firestore é 500 operações por lote
+  const now = Date.now();
   for(let i=0;i<movies.length;i+=chunkSize){
     const chunk = movies.slice(i, i+chunkSize);
     const batch = writeBatch(db);
-    chunk.forEach(m=> batch.set(doc(db,'movies-items',m.id), m));
+    chunk.forEach(m=>{ m.updatedAt = now; batch.set(doc(db,'movies-items',m.id), m); });
     await batch.commit();
   }
+}
+// Como o Firestore não avisa quando um doc é apagado, mantemos um "livro de exclusões":
+// cada exclusão vira uma entrada {id, at} num único doc, e a sincronização incremental
+// consulta as entradas mais novas que o último sync pra saber o que remover localmente.
+async function fbRecordDeletion(movieId){
+  const ref = doc(db,'cineclube','deletions');
+  const entry = { id: movieId, at: Date.now() };
+  try{
+    await updateDoc(ref, { log: arrayUnion(entry) });
+  }catch(e){
+    // doc ainda não existe (primeira exclusão de todas)
+    await setDoc(ref, { log: [entry] }, { merge:true });
+  }
+}
+async function fbGetDeletionsSince(sinceTs){
+  const snap = await getDoc(doc(db,'cineclube','deletions'));
+  if(!snap.exists()) return [];
+  const log = snap.data().log || [];
+  return log.filter(e=> e && e.at > sinceTs).map(e=>e.id);
 }
 
 (function(){
@@ -411,10 +440,23 @@ function slimMovie(m){
     director:m.director, writer:m.writer, actors:m.actors, genres:m.genres,
     runtimeMin:m.runtimeMin, releaseDate:m.releaseDate, countries:m.countries,
     languages:m.languages, primaryLanguage:m.primaryLanguage, production:m.production,
-    ratings:m.ratings, votes:m.votes, checkins:m.checkins, addedAt:m.addedAt,
+    ratings:m.ratings, votes:m.votes, checkins:m.checkins, addedAt:m.addedAt, updatedAt:m.updatedAt,
     dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, keywords:m.keywords, hiddenBy:m.hiddenBy
   };
 }
+
+// Marca de tempo (ms) do último sync bem-sucedido com o Firestore. É a partir dela que a
+// sincronização incremental pergunta "o que mudou desde então?", em vez de baixar tudo de novo.
+const LAST_SYNC_KEY = 'cineclube-last-sync-v1';
+function getLastSyncAt(){
+  try{ const v = localStorage.getItem(LAST_SYNC_KEY); return v ? Number(v) : null; }catch(e){ return null; }
+}
+function setLastSyncAt(ts){
+  try{ localStorage.setItem(LAST_SYNC_KEY, String(ts)); }catch(e){}
+}
+// Pequena folga de segurança: guardamos o horário de sync um pouco no passado, pra
+// tolerar diferenças de relógio entre os aparelhos da família sem perder alterações.
+const SYNC_SAFETY_BUFFER_MS = 3 * 60 * 1000;
 
 function idbOpen(){
   return new Promise((resolve, reject)=>{
@@ -536,17 +578,51 @@ function applyConfigs(results){
 
 function refreshMoviesBackground(){
   // Nunca trava a UI: atualiza quando der e grava cache no idle
-  fbGetAllMovies().then(movies=>{
-    if(!movies || !movies.length) return;
-    state.movies = movies;
-    const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
+  const lastSync = getLastSyncAt();
+  const syncStartedAt = Date.now();
+
+  if(lastSync == null){
+    // Sem marca de sync ainda (1ª vez com esta versão, ou cache antigo de antes da
+    // sincronização incremental existir): busca o catálogo completo uma última vez
+    // para estabelecer a linha de base, e a partir daí passa a sincronizar só as mudanças.
+    fbGetAllMovies().then(movies=>{
+      if(!movies || !movies.length) return;
+      state.movies = movies;
+      setLastSyncAt(syncStartedAt - SYNC_SAFETY_BUFFER_MS);
+      const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
+      if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 3000 });
+      else setTimeout(save, 400);
+      if(!state.modalMovie && !state.addFlow && !state.settingsOpen && !state.importOpen){
+        render();
+      }
+    }).catch(e=>console.error('erro ao atualizar filmes em background (full)', e));
+    return;
+  }
+
+  // Sincronização incremental: só pede ao Firestore os filmes alterados/criados e as
+  // exclusões registradas desde o último sync, em vez do catálogo inteiro de novo.
+  Promise.all([
+    fbGetChangedMovies(lastSync).catch(e=>{ console.error('erro ao buscar alterações do catálogo', e); return null; }),
+    fbGetDeletionsSince(lastSync).catch(e=>{ console.error('erro ao buscar exclusões do catálogo', e); return []; })
+  ]).then(([changed, deletedIds])=>{
+    if(changed === null) return; // falhou a busca incremental — tenta de novo na próxima; cache local fica intacto
+    if(!changed.length && !deletedIds.length){
+      setLastSyncAt(syncStartedAt - SYNC_SAFETY_BUFFER_MS);
+      return; // nada mudou — não regrava cache nem redesenha à toa
+    }
+    const byId = new Map(state.movies.map(m=>[m.id, m]));
+    changed.forEach(m=> byId.set(m.id, m));
+    deletedIds.forEach(id=> byId.delete(id));
+    const merged = Array.from(byId.values());
+    state.movies = merged;
+    setLastSyncAt(syncStartedAt - SYNC_SAFETY_BUFFER_MS);
+    const save = ()=>{ try{ saveMoviesCache(merged); }catch(e){} };
     if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 3000 });
     else setTimeout(save, 400);
     if(!state.modalMovie && !state.addFlow && !state.settingsOpen && !state.importOpen){
-      // Re-render suave: só se ainda na home
       render();
     }
-  }).catch(e=>console.error('erro ao atualizar filmes em background', e));
+  });
 }
 
 async function init(){
@@ -600,6 +676,7 @@ async function init(){
   // Sem cache: spinner + carrega do Firestore (inevitável na 1ª vez)
   state.booted = false;
   render();
+  const firstLoadStartedAt = Date.now();
 
   try{
     const results = await Promise.all([
@@ -626,6 +703,7 @@ async function init(){
     }
     state.movies = list;
     if(list.length){
+      setLastSyncAt(firstLoadStartedAt - SYNC_SAFETY_BUFFER_MS);
       setTimeout(()=>{ try{ saveMoviesCache(list); }catch(e){} }, 200);
     }
   }catch(e){
