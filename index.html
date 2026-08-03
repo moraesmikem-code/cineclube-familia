@@ -202,7 +202,13 @@
 </style>
 </head>
 <body>
-<div id="app"></div>
+<div id="app">
+  <div style="min-height:70vh;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:system-ui,sans-serif;background:#0E0C0A;color:#A89F94">
+    <div style="width:28px;height:28px;border:3px solid #2A241C;border-top-color:#D4A72C;border-radius:50%;animation:bootspin .8s linear infinite"></div>
+    <div style="font-size:14px;margin-top:12px">Abrindo…</div>
+  </div>
+</div>
+<style>@keyframes bootspin{to{transform:rotate(360deg)}}</style>
 
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
@@ -434,88 +440,104 @@ function saveMoviesCache(movies){
   }
 }
 
-async function init(){
-  // 1) Tudo que for LOCAL e síncrono primeiro → primeira pintura sem esperar rede
-  try{ state.me = localStorage.getItem('my-identity') || null; }catch(e){ state.me = null; }
-  // Family mínima para a UI não quebrar até o Firestore responder
-  if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
+function applyConfigs(results){
+  const [fam, key, tmdbKey, lastGeneralUpdate, updateErrorLogRaw, importErrorLogRaw, watchlists, watching, noted, me] = results;
+  if(fam){ try{ state.family = JSON.parse(fam); }catch(e){} }
+  state.apiKey = key || null;
+  state.tmdbKey = tmdbKey || null;
+  state.lastGeneralUpdateAt = lastGeneralUpdate || null;
+  try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
+  try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
+  state.watchlists = watchlists ? JSON.parse(watchlists) : {};
+  state.lists = {
+    priorities: state.watchlists,
+    watching: watching ? JSON.parse(watching) : {},
+    noted: noted ? JSON.parse(noted) : {}
+  };
+  if(me) state.me = me;
+}
 
-  const cached = loadMoviesCache();
+function refreshMoviesBackground(){
+  // Nunca trava a UI: atualiza quando der e grava cache no idle
+  fbGetAllMovies().then(movies=>{
+    if(!movies || !movies.length) return;
+    state.movies = movies;
+    const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
+    if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 3000 });
+    else setTimeout(save, 400);
+    if(!state.modalMovie && !state.addFlow && !state.settingsOpen && !state.importOpen){
+      // Re-render suave: só se ainda na home
+      render();
+    }
+  }).catch(e=>console.error('erro ao atualizar filmes em background', e));
+}
+
+async function init(){
+  // Identidade local imediata
+  try{ state.me = localStorage.getItem('my-identity') || null; }catch(e){ state.me = null; }
+  if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
+  state.catalogPageSize = 24;
+
+  // Cache local → UI na hora (sem await de rede)
+  let cached = null;
+  try{ cached = loadMoviesCache(); }catch(e){ cached = null; }
+
   if(cached && cached.length){
     state.movies = cached;
     state.booted = true;
-    state.catalogPageSize = 24; // primeira tela mais leve
-    render(); // abre NA HORA com cache
-  } else {
-    state.booted = false;
-    render(); // só spinner se não há cache
+    render();
+    // Cede o thread para o browser pintar antes de qualquer rede
+    await new Promise(r => setTimeout(r, 0));
+
+    // Rede só em background — NÃO await
+    Promise.all([
+      sGet('family-config', true), sGet('omdb-key', true), sGet('tmdb-key', true),
+      sGet('last-general-update', true), sGet('update-error-log', true), sGet('import-error-log', true),
+      sGet('watchlists-v1', true), sGet('watching-v1', true), sGet('noted-v1', true),
+      sGet('my-identity', false)
+    ]).then(applyConfigs).then(()=>{ if(state.booted) render(); }).catch(()=>{});
+
+    // Atrasa um pouco o getDocs pesado para não competir com a 1ª pintura
+    setTimeout(refreshMoviesBackground, 600);
+    return;
   }
 
-  // 2) Rede em paralelo: configs + (se preciso) catálogo
-  const configsP = Promise.all([
-    sGet('family-config', true),
-    sGet('omdb-key', true),
-    sGet('tmdb-key', true),
-    sGet('last-general-update', true),
-    sGet('update-error-log', true),
-    sGet('import-error-log', true),
-    sGet('watchlists-v1', true),
-    sGet('watching-v1', true),
-    sGet('noted-v1', true),
-    sGet('my-identity', false)
-  ]);
+  // Sem cache: spinner + carrega do Firestore (inevitável na 1ª vez)
+  state.booted = false;
+  render();
 
-  const moviesP = fbGetAllMovies().catch(e=>{
-    console.error('erro ao carregar filmes', e);
-    return null;
-  });
-
-  // Aplica configs quando chegarem (não bloqueia a tela se já tem cache)
-  configsP.then(([fam, key, tmdbKey, lastGeneralUpdate, updateErrorLogRaw, importErrorLogRaw, watchlists, watching, noted, me])=>{
-    if(fam){ try{ state.family = JSON.parse(fam); }catch(e){} }
-    state.apiKey = key || null;
-    state.tmdbKey = tmdbKey || null;
-    state.lastGeneralUpdateAt = lastGeneralUpdate || null;
-    try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
-    try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
-    state.watchlists = watchlists ? JSON.parse(watchlists) : {};
-    state.lists = {
-      priorities: state.watchlists,
-      watching: watching ? JSON.parse(watching) : {},
-      noted: noted ? JSON.parse(noted) : {}
-    };
-    if(me) state.me = me;
-    // Atualiza header/identidade sem refazer catálogo inteiro se possível
-    if(state.booted) render();
-  }).catch(e=>console.error('erro configs', e));
-
-  // 3) Catálogo do Firestore
-  let movies = await moviesP;
-  if((!movies || movies.length === 0) && !(cached && cached.length)){
-    try{
-      const legacyJson = await sGet('movies-v1', true);
-      if(legacyJson){
-        const legacyMovies = JSON.parse(legacyJson);
-        if(legacyMovies.length){
-          movies = legacyMovies;
-          fbSaveMoviesBatch(movies).catch(()=>{});
+  try{
+    const results = await Promise.all([
+      sGet('family-config', true), sGet('omdb-key', true), sGet('tmdb-key', true),
+      sGet('last-general-update', true), sGet('update-error-log', true), sGet('import-error-log', true),
+      sGet('watchlists-v1', true), sGet('watching-v1', true), sGet('noted-v1', true),
+      sGet('my-identity', false),
+      fbGetAllMovies().catch(e=>{ console.error(e); return []; })
+    ]);
+    const movies = results.pop();
+    applyConfigs(results);
+    let list = movies || [];
+    if(!list.length){
+      try{
+        const legacyJson = await sGet('movies-v1', true);
+        if(legacyJson){
+          const legacyMovies = JSON.parse(legacyJson);
+          if(legacyMovies.length){
+            list = legacyMovies;
+            fbSaveMoviesBatch(list).catch(()=>{});
+          }
         }
-      }
-    }catch(e){ console.error('erro na migração', e); }
+      }catch(e){}
+    }
+    state.movies = list;
+    if(list.length){
+      setTimeout(()=>{ try{ saveMoviesCache(list); }catch(e){} }, 200);
+    }
+  }catch(e){
+    console.error('init falhou', e);
   }
-
-  if(movies && movies.length){
-    state.movies = movies;
-    // Grava cache em idle para não competir com a pintura
-    const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
-    if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 2500 });
-    else setTimeout(save, 300);
-  }
-
   state.booted = true;
-  // Só re-renderiza se o usuário não está no meio de um modal/fluxo
-  if(!state.modalMovie && !state.addFlow && !state.settingsOpen) render();
-  else if(!(cached && cached.length)) render();
+  render();
 }
 
 /* ---------- IMDB / OMDB / TMDB ---------- */
