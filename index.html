@@ -969,8 +969,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  // "v9" no key força recalcular depois da mudança de fórmula
-  const key = 'v9:' + person + ':' + ratedCountFor(person);
+  // "v11" no key força recalcular depois da mudança de fórmula
+  const key = 'v11:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -2339,9 +2339,40 @@ function buildTasteProfile(person, excludeId){
   return buildTasteProfileRaw(person, excludeId);
 }
 
+// Detecta mesma franquia/sequência pelo título (ex.: Tropa de Elite / Tropa de Elite 2)
+function franchiseRoot(m){
+  let t = displayTitle(m) || m.title || m.titleEn || m.titleOriginal || '';
+  t = String(t).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  t = t.replace(/:\s*.+$/, ''); // remove subtítulo após :
+  t = t.replace(/\s*[-–—]\s*.+$/, '');
+  t = t.replace(/\b(part|parte|chapter|capitulo|capítulo|volume|vol\.?)\s*\d+\b/g, '');
+  t = t.replace(/\b(ii|iii|iv|v|vi|vii|viii|ix|x|\d+)\b/g, '');
+  t = t.replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  // primeiros tokens significativos (evita raiz vazia)
+  const words = t.split(' ').filter(w => w.length > 1);
+  return words.slice(0, 4).join(' ');
+}
+function sameFranchise(a, b){
+  if(!a || !b || a.id === b.id) return false;
+  const ra = franchiseRoot(a), rb = franchiseRoot(b);
+  if(!ra || !rb || ra.length < 5 || rb.length < 5) return false;
+  if(ra === rb) return true;
+  if(ra.includes(rb) || rb.includes(ra)) return true;
+  // mesmo diretor + títulos muito parecidos
+  const da = (a.director||'').toLowerCase().split(',')[0].trim();
+  const db = (b.director||'').toLowerCase().split(',')[0].trim();
+  if(da && db && da === db){
+    const wa = ra.split(' '), wb = rb.split(' ');
+    const common = wa.filter(w => wb.includes(w));
+    if(common.length >= 2) return true;
+  }
+  return false;
+}
+
 function buildTasteProfileRaw(person, excludeId){
   const maps = { genre:{}, director:{}, actor:{}, writer:{}, country:{}, decade:{}, studio:{}, genreDecade:{}, genreCountry:{}, genreDecadeCountry:{}, keyword:{}, runtime:{} };
   let count = 0;
+  const target = excludeId ? state.movies.find(x => x.id === excludeId) : null;
   function bump(map, key, w){
     if(!map[key]) map[key] = { sum:0, n:0 };
     map[key].sum += w;
@@ -2374,18 +2405,19 @@ function buildTasteProfileRaw(person, excludeId){
   }
   state.movies.forEach(m=>{
     if(m.id === excludeId) return;
+    // Franquia/sequência: a nota de um não deve dominar a previsão do outro
+    const franchiseMul = (target && sameFranchise(m, target)) ? 0.15 : 1;
     const v = m.votes[person];
     if(v && v.score!=null){
       count++;
-      applyMovie(m, v.score - 5.5);
+      applyMovie(m, (v.score - 5.5) * franchiseMul);
     } else if(m.abandonedBy && m.abandonedBy[person]){
-      // Abandono = proxy negativo (confiança ~70% de uma nota explícita)
       const pct = m.abandonedBy[person].pctWatched;
       const eq = abandonToScore(pct);
       count++;
-      applyMovie(m, (eq - 5.5) * 0.7);
+      applyMovie(m, (eq - 5.5) * 0.7 * franchiseMul);
     } else if(m.dismissedBy && m.dismissedBy.includes(person)){
-      applyMovie(m, -2.5);
+      applyMovie(m, -2.5 * franchiseMul);
     }
   });
   return { maps, count };
@@ -2769,55 +2801,58 @@ function estimateAffinity(movie, person){
   const metaVal = ratings.metacritic;
 
   // Qualidade externa em 2 camadas.
-  // Em filme político, RT/Meta NÃO entram na qualidade quando:
-  //  (A) crítica baixa e IMDb alto → não pune filme “não pró-esquerda” (Tropa 1)
-  //  (B) crítica alta → não premia filme “pró-esquerda” via establishment (Tropa 2)
-  // Nesses casos a qualidade usa só o IMDb.
+  // (A) IMDb alto + crítica baixa → IMDb puro (Tropa 1)
+  // (B) político + crítica alta → só IMDb, sem prêmio de establishment (Tropa 2)
   let extScore = null;
+  let discardedCriticsLow = false;
   {
     let criticVals = [];
-    if (rtVal != null) criticVals.push(rtVal);
-    if (metaVal != null) criticVals.push(metaVal);
+    if (rtVal != null) criticVals.push(Number(rtVal));
+    if (metaVal != null) criticVals.push(Number(metaVal));
     let criticAvg = criticVals.length
       ? criticVals.reduce((a,b)=>a+b,0) / criticVals.length
       : null;
 
     const textPol = ((movie.synopsisPt||'')+' '+(movie.plot||'')+' '+(movie.keywords||[]).join(' ')+' '+(movie.genres||[]).join(' ')+' '+(movie.director||'')).toLowerCase();
     const looksPolitical = /\b(politic|política|policial|corrup|congress|partido|eleic|ditadura|military|crime|police|impeachment|lula|dilma)\b/i.test(textPol)
-      || (movie.genres||[]).some(g => /politic|crime|police|policial|document/i.test(g));
-    const countriesPol = (movie.countries||[]).map(c=>String(c).toLowerCase());
-    const isBR = countriesPol.some(c => c.includes('brasil') || c.includes('brazil'));
+      || (movie.genres||[]).some(g => /politic|crime|police|policial|document/i.test(String(g)));
 
     if (criticAvg != null && imdbVal != null) {
-      // (A) Público alto, crítica baixa → SEMPRE ignora RT/Meta (Tropa 1), sem depender de tags
-      const criticsLow = imdbVal >= 7.0 && criticAvg <= imdbVal - 1.2;
-      // (B) Político + crítica alta → não premia com RT/Meta (Tropa 2)
-      const criticsHigh = looksPolitical && (criticAvg >= 7.5 || (rtVal != null && rtVal >= 8.0));
-      if (criticsLow || criticsHigh) {
+      const imdbN = Number(imdbVal);
+      const criticsLow = imdbN >= 7.0 && criticAvg <= imdbN - 1.2;
+      const criticsHigh = looksPolitical && (criticAvg >= 7.5 || (rtVal != null && Number(rtVal) >= 8.0));
+      if (criticsLow) {
+        criticAvg = null;
+        discardedCriticsLow = true;
+      } else if (criticsHigh) {
         criticAvg = null;
       }
     }
 
-    let sum = 0, wSum = 0;
-    const CRITIC_W = 1.0;
-    const IMDB_BASE_W = 2.0;
-
-    if (imdbVal != null) {
-      let imdbW = IMDB_BASE_W;
-      if (imdbVotes != null) {
-        imdbW = Math.min(4.0, IMDB_BASE_W + Math.log10(imdbVotes + 1) / 3);
+    if (discardedCriticsLow && imdbVal != null) {
+      // Qualidade = IMDb puro, sem diluir com nada
+      extScore = Number(imdbVal);
+    } else {
+      let sum = 0, wSum = 0;
+      const CRITIC_W = 1.0;
+      const IMDB_BASE_W = 2.0;
+      if (imdbVal != null) {
+        let imdbW = IMDB_BASE_W;
+        if (imdbVotes != null) {
+          imdbW = Math.min(4.0, IMDB_BASE_W + Math.log10(imdbVotes + 1) / 3);
+        }
+        if (criticAvg == null) imdbW = Math.max(imdbW, 3.0);
+        sum += Number(imdbVal) * imdbW;
+        wSum += imdbW;
       }
-      if (criticAvg == null) imdbW = Math.max(imdbW, 3.0);
-      sum += imdbVal * imdbW;
-      wSum += imdbW;
+      if (criticAvg != null) {
+        let cW = CRITIC_W;
+        if (imdbVal != null && Math.abs(Number(imdbVal) - criticAvg) > 1.5) cW *= 0.5;
+        sum += criticAvg * cW;
+        wSum += cW;
+      }
+      if (wSum > 0) extScore = sum / wSum;
     }
-    if (criticAvg != null) {
-      let cW = CRITIC_W;
-      if (imdbVal != null && Math.abs(imdbVal - criticAvg) > 1.5) cW *= 0.5;
-      sum += criticAvg * cW;
-      wSum += cW;
-    }
-    if (wSum > 0) extScore = sum / wSum;
   }
   const hasExtPenaltyCountry = (movie.countries || []).some(c => PENALTY_COUNTRIES.has(c));
 
@@ -2853,7 +2888,10 @@ function estimateAffinity(movie, person){
   if (extScore != null && !hasExtPenaltyCountry) {
     qualityPct = 50 + (extScore - 6.5) * 11;
     let qualityConf = 1;
-    if (imdbVal == null) {
+    if (discardedCriticsLow) {
+      // Crítica hostil descartada: confia no IMDb (público) sem amortecer
+      qualityConf = 1;
+    } else if (imdbVal == null) {
       qualityConf = 0.25;
     } else if (imdbVotes != null) {
       qualityConf = Math.min(1, Math.log10(imdbVotes + 1) / 4.7);
@@ -2881,6 +2919,11 @@ function estimateAffinity(movie, person){
   }
   // Garante faixa útil
   tasteWeight = Math.max(0.10, Math.min(0.45, tasteWeight));
+  // Quando a crítica hostil foi descartada, o IMDb manda: reduz peso do gosto
+  // (evita a nota 6 da sequência no mesmo diretor afundar o original no leave-one-out)
+  if (discardedCriticsLow) {
+    tasteWeight = Math.min(tasteWeight, 0.12);
+  }
   const qualityWeight = 1 - tasteWeight;
   let pctFinal = tastePct * tasteWeight + qualityPct * qualityWeight;
 
@@ -3143,7 +3186,7 @@ function explainRecommendation(movie, person){
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
   const evid = Math.max(0, Math.min(1, maxPossible / 12));
-  down.push(`🔧 Diagnóstico v9: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  down.push(`🔧 Diagnóstico v11: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
