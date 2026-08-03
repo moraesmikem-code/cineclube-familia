@@ -405,35 +405,54 @@ function loadMoviesCache(){
   return null;
 }
 function saveMoviesCache(movies){
+  // Sempre grava versão enxuta: abre bem mais rápido (~6000 títulos).
+  // Sinopse/keywords/temporadas vêm do Firestore em background.
   try{
-    localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies }));
+    const slim = movies.map(m=>({
+      id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
+      titleEn:m.titleEn, year:m.year, poster:m.poster, posterCustom:m.posterCustom,
+      director:m.director, writer:m.writer,
+      actors:m.actors, genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
+      countries:m.countries, languages:m.languages, primaryLanguage:m.primaryLanguage,
+      production:m.production, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
+      addedAt:m.addedAt, dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy,
+      keywords:m.keywords // útil pro algoritmo; listas curtas
+    }));
+    localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim, slim:true }));
   }catch(e){
-    // Se estourar a cota (~5MB), grava versão enxuta (sem sinopse/keywords/seasons)
     try{
-      const slim = movies.map(m=>({
+      // Ainda maior: tira keywords também
+      const slim2 = movies.map(m=>({
         id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
-        titleEn:m.titleEn, year:m.year, poster:m.poster, director:m.director, writer:m.writer,
-        actors:m.actors, genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
-        countries:m.countries, languages:m.languages, primaryLanguage:m.primaryLanguage,
-        production:m.production, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
-        addedAt:m.addedAt, dismissedBy:m.dismissedBy
+        titleEn:m.titleEn, year:m.year, poster:m.poster, director:m.director,
+        genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
+        countries:m.countries, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
+        addedAt:m.addedAt
       }));
-      localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim, slim:true }));
+      localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim2, slim:true }));
     }catch(e2){ /* desiste do cache */ }
   }
 }
 
 async function init(){
-  // Spinner imediato (antes de qualquer await)
-  state.booted = false;
-  render();
+  // 1) Tudo que for LOCAL e síncrono primeiro → primeira pintura sem esperar rede
+  try{ state.me = localStorage.getItem('my-identity') || null; }catch(e){ state.me = null; }
+  // Family mínima para a UI não quebrar até o Firestore responder
+  if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
 
-  // Configs em paralelo (antes eram ~10 awaits em sequência)
-  const [
-    fam, key, tmdbKey, lastGeneralUpdate,
-    updateErrorLogRaw, importErrorLogRaw,
-    watchlists, watching, noted, me
-  ] = await Promise.all([
+  const cached = loadMoviesCache();
+  if(cached && cached.length){
+    state.movies = cached;
+    state.booted = true;
+    state.catalogPageSize = 24; // primeira tela mais leve
+    render(); // abre NA HORA com cache
+  } else {
+    state.booted = false;
+    render(); // só spinner se não há cache
+  }
+
+  // 2) Rede em paralelo: configs + (se preciso) catálogo
+  const configsP = Promise.all([
     sGet('family-config', true),
     sGet('omdb-key', true),
     sGet('tmdb-key', true),
@@ -446,58 +465,57 @@ async function init(){
     sGet('my-identity', false)
   ]);
 
-  state.family = fam ? JSON.parse(fam) : null;
-  state.apiKey = key || null;
-  state.tmdbKey = tmdbKey || null;
-  state.lastGeneralUpdateAt = lastGeneralUpdate || null;
-  try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
-  try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
-  state.watchlists = watchlists ? JSON.parse(watchlists) : {};
-  state.lists = {
-    priorities: state.watchlists,
-    watching: watching ? JSON.parse(watching) : {},
-    noted: noted ? JSON.parse(noted) : {}
-  };
-  state.me = me || null;
+  const moviesP = fbGetAllMovies().catch(e=>{
+    console.error('erro ao carregar filmes', e);
+    return null;
+  });
 
-  // 1) Cache local → abre o app na hora
-  const cached = loadMoviesCache();
-  if(cached && cached.length){
-    state.movies = cached;
-    state.booted = true;
-    render();
-    // 2) Firestore em background (atualiza sem travar a tela)
-    fbGetAllMovies().then(movies=>{
-      if(movies && movies.length){
-        state.movies = movies;
-        saveMoviesCache(movies);
-        if(!state.modalMovie && !state.addFlow && !state.settingsOpen) render();
-      }
-    }).catch(e=>console.error('erro ao atualizar filmes em background', e));
-    return;
-  }
+  // Aplica configs quando chegarem (não bloqueia a tela se já tem cache)
+  configsP.then(([fam, key, tmdbKey, lastGeneralUpdate, updateErrorLogRaw, importErrorLogRaw, watchlists, watching, noted, me])=>{
+    if(fam){ try{ state.family = JSON.parse(fam); }catch(e){} }
+    state.apiKey = key || null;
+    state.tmdbKey = tmdbKey || null;
+    state.lastGeneralUpdateAt = lastGeneralUpdate || null;
+    try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
+    try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
+    state.watchlists = watchlists ? JSON.parse(watchlists) : {};
+    state.lists = {
+      priorities: state.watchlists,
+      watching: watching ? JSON.parse(watching) : {},
+      noted: noted ? JSON.parse(noted) : {}
+    };
+    if(me) state.me = me;
+    // Atualiza header/identidade sem refazer catálogo inteiro se possível
+    if(state.booted) render();
+  }).catch(e=>console.error('erro configs', e));
 
-  // Sem cache: carrega do Firestore (1ª abertura ou cache limpo)
-  let movies = [];
-  try{
-    movies = await fbGetAllMovies();
-  }catch(e){ console.error('erro ao carregar filmes', e); }
-  if(movies.length === 0){
+  // 3) Catálogo do Firestore
+  let movies = await moviesP;
+  if((!movies || movies.length === 0) && !(cached && cached.length)){
     try{
       const legacyJson = await sGet('movies-v1', true);
       if(legacyJson){
         const legacyMovies = JSON.parse(legacyJson);
         if(legacyMovies.length){
           movies = legacyMovies;
-          await fbSaveMoviesBatch(movies);
+          fbSaveMoviesBatch(movies).catch(()=>{});
         }
       }
     }catch(e){ console.error('erro na migração', e); }
   }
-  state.movies = movies;
-  if(movies.length) saveMoviesCache(movies);
+
+  if(movies && movies.length){
+    state.movies = movies;
+    // Grava cache em idle para não competir com a pintura
+    const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
+    if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 2500 });
+    else setTimeout(save, 300);
+  }
+
   state.booted = true;
-  render();
+  // Só re-renderiza se o usuário não está no meio de um modal/fluxo
+  if(!state.modalMovie && !state.addFlow && !state.settingsOpen) render();
+  else if(!(cached && cached.length)) render();
 }
 
 /* ---------- IMDB / OMDB / TMDB ---------- */
