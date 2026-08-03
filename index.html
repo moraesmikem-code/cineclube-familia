@@ -969,8 +969,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  // "v8" no key força recalcular depois da mudança de fórmula
-  const key = 'v8:' + person + ':' + ratedCountFor(person);
+  // "v9" no key força recalcular depois da mudança de fórmula
+  const key = 'v9:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -2788,11 +2788,12 @@ function estimateAffinity(movie, person){
     const countriesPol = (movie.countries||[]).map(c=>String(c).toLowerCase());
     const isBR = countriesPol.some(c => c.includes('brasil') || c.includes('brazil'));
 
-    if (looksPolitical && criticAvg != null) {
-      const criticsLow = imdbVal != null && imdbVal >= 7.0 && criticAvg <= imdbVal - 1.2;
-      const criticsHigh = criticAvg >= 7.5 || (rtVal != null && rtVal >= 8.0);
-      // (A) crítica baixa ou (B) crítica alta em político (sobretudo BR) → só IMDb
-      if (criticsLow || (criticsHigh && (isBR || looksPolitical))) {
+    if (criticAvg != null && imdbVal != null) {
+      // (A) Público alto, crítica baixa → SEMPRE ignora RT/Meta (Tropa 1), sem depender de tags
+      const criticsLow = imdbVal >= 7.0 && criticAvg <= imdbVal - 1.2;
+      // (B) Político + crítica alta → não premia com RT/Meta (Tropa 2)
+      const criticsHigh = looksPolitical && (criticAvg >= 7.5 || (rtVal != null && rtVal >= 8.0));
+      if (criticsLow || criticsHigh) {
         criticAvg = null;
       }
     }
@@ -3142,7 +3143,7 @@ function explainRecommendation(movie, person){
   const { raw, maxPossible } = rawTasteSignal(movie, maps);
   const ratio = maxPossible > 0 ? (raw/maxPossible) : 0;
   const evid = Math.max(0, Math.min(1, maxPossible / 12));
-  down.push(`🔧 Diagnóstico v8: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
+  down.push(`🔧 Diagnóstico v9: raw=${raw.toFixed(2)} max=${maxPossible.toFixed(2)} razão=${ratio.toFixed(3)} evidência=${evid.toFixed(2)} corr=${corr.toFixed(2)} avaliados=${count}`);
 
   return { up: up.slice(0,4), down: down.slice(0,8) };
 }
