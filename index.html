@@ -2732,6 +2732,25 @@ function isForcedCommiePenalty(movie){
   // Brasil + (impeachment/Lula/PT/ditadura) + tom de denúncia
   if(isBR && hasLeftTheme && hasDenuncia) return true;
 
+  // Heurística crítica × público (Tropa 1 vs Tropa 2):
+  // Filme político/BR + crítica (RT/Meta) bem acima do IMDb → sinal de “aprovado pelo establishment”.
+  // Tropa 1: IMDb 8 / RT 5 / Meta 3 → gap negativo → NÃO penaliza
+  // Tropa 2: IMDb 8 / RT 9 / Meta 7 → gap positivo → penaliza
+  {
+    const imdb = movie.ratings && movie.ratings.imdb != null ? Number(movie.ratings.imdb) : null;
+    const rt = movie.ratings && movie.ratings.rtCritics != null ? Number(movie.ratings.rtCritics) : null;
+    const meta = movie.ratings && movie.ratings.metacritic != null ? Number(movie.ratings.metacritic) : null;
+    const criticVals = [rt, meta].filter(v => v != null && !isNaN(v));
+    if(imdb != null && criticVals.length){
+      const criticAvg = criticVals.reduce((a,b)=>a+b,0) / criticVals.length;
+      const gap = criticAvg - imdb;
+      const looksPolitical = hasLeftTheme || hasDenuncia
+        || /\b(politic|politica|policial|corrup|congress|senado|partido|eleic|ditadura|military)\b/i.test(text)
+        || genres.some(g => /politic|crime|police|policial/.test(g));
+      if(isBR && looksPolitical && criticAvg >= 7.0 && gap >= 0.3) return true;
+    }
+  }
+
   return false;
 }
 
@@ -2755,14 +2774,26 @@ function estimateAffinity(movie, person){
   // Qualidade externa em 2 camadas (evita voto duplo da crítica):
   // 1) RT + Metacritic → uma "nota de crítica"
   // 2) essa crítica + IMDb (público), com IMDb pesando o dobro
+  // Exceção: filme político com IMDb alto e RT/Meta baixos → ignora a crítica
+  // (caso Tropa de Elite 1: público 8, crítica ~4 — não deixar a crítica arrastar a %)
   let extScore = null;
   {
     let criticVals = [];
     if (rtVal != null) criticVals.push(rtVal);
     if (metaVal != null) criticVals.push(metaVal);
-    const criticAvg = criticVals.length
+    let criticAvg = criticVals.length
       ? criticVals.reduce((a,b)=>a+b,0) / criticVals.length
       : null;
+
+    // Detecta filme político + IMDb alto + crítica baixa → descarta RT/Meta
+    if (imdbVal != null && criticAvg != null && imdbVal >= 7.0 && criticAvg <= imdbVal - 1.5) {
+      const textPol = ((movie.synopsisPt||'')+' '+(movie.plot||'')+' '+(movie.keywords||[]).join(' ')+' '+(movie.genres||[]).join(' ')+' '+(movie.director||'')).toLowerCase();
+      const looksPolitical = /\b(politic|política|policial|corrup|congress|partido|eleic|ditadura|military|crime|police|impeachment|lula|dilma)\b/i.test(textPol)
+        || (movie.genres||[]).some(g => /politic|crime|police|policial|document/i.test(g));
+      if (looksPolitical) {
+        criticAvg = null; // só IMDb na qualidade
+      }
+    }
 
     let sum = 0, wSum = 0;
     const CRITIC_W = 1.0;
@@ -2773,6 +2804,8 @@ function estimateAffinity(movie, person){
       if (imdbVotes != null) {
         imdbW = Math.min(4.0, IMDB_BASE_W + Math.log10(imdbVotes + 1) / 3);
       }
+      // Se só IMDb (crítica descartada), peso cheio
+      if (criticAvg == null) imdbW = Math.max(imdbW, 3.0);
       sum += imdbVal * imdbW;
       wSum += imdbW;
     }
