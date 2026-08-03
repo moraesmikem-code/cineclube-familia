@@ -119,6 +119,7 @@
   .ticket{
     position:relative;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
     margin:14px 0;overflow:hidden;display:flex;
+    content-visibility:auto;contain-intrinsic-size:0 190px;
   }
   .ticket .poster{width:96px;min-width:96px;background:var(--panel2);object-fit:cover;}
   .ticket .poster-ph{width:96px;min-width:96px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:30px;background:var(--panel2);}
@@ -898,24 +899,36 @@ const COUNTRY_CONTINENT = {
   'Australia':'Oceania','New Zealand':'Oceania',
 };
 function countryToContinent(c){ return COUNTRY_CONTINENT[c] || null; }
-function allContinents(){
-  const set = new Set();
-  state.movies.forEach(m => (m.countries||[]).forEach(c=>{ const cont = countryToContinent(c); if(cont) set.add(cont); }));
-  return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
-}
-function allLanguages(){
-  const set = new Set();
-  state.movies.forEach(m => { const l = m.primaryLanguage || (m.languages||[])[0]; if(l) set.add(l); });
-  return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
-}
-function allDecades(){
-  const set = new Set();
+// Cache das listas derivadas do catálogo (gêneros/décadas/continentes/idiomas):
+// só recalcula quando a referência de state.movies muda (novo filme, import, sync),
+// não a cada toque em filtro/ordenação — evita varrer o catálogo inteiro em cada render.
+let _filterMetaCache = { movies:null, genres:null, decades:null, continents:null, languages:null };
+function ensureFilterMetaCache(){
+  if(_filterMetaCache.movies === state.movies) return _filterMetaCache;
+  const genreSet = new Set(MASTER_GENRE_LIST);
+  const decadeSet = new Set();
+  const continentSet = new Set();
+  const languageSet = new Set();
   state.movies.forEach(m=>{
+    (m.genres||[]).forEach(g=>genreSet.add(g));
     const y = parseInt(m.year);
-    if(!isNaN(y)) set.add(Math.floor(y/10)*10);
+    if(!isNaN(y)) decadeSet.add(Math.floor(y/10)*10);
+    (m.countries||[]).forEach(c=>{ const cont = countryToContinent(c); if(cont) continentSet.add(cont); });
+    const l = m.primaryLanguage || (m.languages||[])[0];
+    if(l) languageSet.add(l);
   });
-  return Array.from(set).sort((a,b)=>b-a);
+  _filterMetaCache = {
+    movies: state.movies,
+    genres: Array.from(genreSet).sort((a,b)=>a.localeCompare(b,'pt-BR')),
+    decades: Array.from(decadeSet).sort((a,b)=>b-a),
+    continents: Array.from(continentSet).sort((a,b)=>a.localeCompare(b,'pt-BR')),
+    languages: Array.from(languageSet).sort((a,b)=>a.localeCompare(b,'pt-BR'))
+  };
+  return _filterMetaCache;
 }
+function allContinents(){ return ensureFilterMetaCache().continents; }
+function allLanguages(){ return ensureFilterMetaCache().languages; }
+function allDecades(){ return ensureFilterMetaCache().decades; }
 
 const GENRE_MAP = {
   'Action':'Ação', 'Adventure':'Aventura', 'Animation':'Animação', 'Biography':'Biografia',
@@ -933,11 +946,7 @@ function translateGenre(g){ return GENRE_MAP[g] || g; }
 function whoCheckedIn(movie){
   return state.family.members.filter(m => movie.checkins && movie.checkins[m]);
 }
-function allGenres(){
-  const set = new Set(MASTER_GENRE_LIST);
-  state.movies.forEach(m => (m.genres||[]).forEach(g=>set.add(g)));
-  return Array.from(set).sort((a,b)=>a.localeCompare(b,'pt-BR'));
-}
+function allGenres(){ return ensureFilterMetaCache().genres; }
 
 function sortOptions(){
   const opts = [
@@ -1178,19 +1187,20 @@ function sortMovieList(list, field, dir){
         return 0;
     }
   }
-  const out = list.slice();
-  out.sort((a,b)=>{
-    const ka=keyOf(a), kb=keyOf(b);
-    if(ka<kb) return -1*dirMul;
-    if(ka>kb) return 1*dirMul;
-    if(field==='recommendation'){
-      const ia = (a.ratings && a.ratings.imdb != null) ? a.ratings.imdb : -1;
-      const ib = (b.ratings && b.ratings.imdb != null) ? b.ratings.imdb : -1;
-      if(ia!==ib) return (ia<ib) ? 1 : -1; // desempate: maior nota do IMDb primeiro, sempre
-    }
+  // Decorate-sort-undecorate: calcula a chave de cada item 1x (em vez de a cada comparação
+  // dentro do sort, que chamaria keyOf ~n*log(n) vezes num catálogo de milhares de itens).
+  const decorated = list.map(m=>{
+    const k = keyOf(m);
+    const imdbTie = field==='recommendation' ? ((m.ratings && m.ratings.imdb != null) ? m.ratings.imdb : -1) : 0;
+    return { m, k, imdbTie };
+  });
+  decorated.sort((a,b)=>{
+    if(a.k<b.k) return -1*dirMul;
+    if(a.k>b.k) return 1*dirMul;
+    if(field==='recommendation' && a.imdbTie!==b.imdbTie) return (a.imdbTie<b.imdbTie) ? 1 : -1;
     return 0;
   });
-  return out;
+  return decorated.map(d=>d.m);
 }
 
 function catalogListHtml(list){
@@ -1327,36 +1337,14 @@ function renderIdentityPicker(){
   };
 }
 
-function renderMain(){
+// Filtros + Ordenar + Catálogo extraídos numa função própria: isso permite atualizar
+// só esse pedaço da tela (refreshFiltersAndCatalog) quando o usuário toca num filtro,
+// em vez de redesenhar o cabeçalho/busca/toolbar inteiros a cada toque.
+function filtersAndCatalogHtml(){
   const list = getFilteredSorted();
   const genres = allGenres();
   const f = state.filters;
-  app.innerHTML = `
-  <div class="container">
-    <header class="top">
-      <div class="brand">
-        <div>
-          <h1>Cineclube</h1>
-          <small>da Família</small>
-        </div>
-        <div class="identity-pill" onclick="__openSettings()"><span class="dot"></span>${state.me} ⚙︎</div>
-      </div>
-      <div class="toolbar">
-        <button class="btn btn-ghost btn-sm" onclick="__openList('priorities')">📋 Prioridades</button>
-        <button class="btn btn-ghost btn-sm" onclick="__openList('watching')">👀 Assistindo</button>
-        <button class="btn btn-ghost btn-sm" onclick="__openList('noted')">📝 Anotados</button>
-      </div>
-      <div class="hint" style="margin:-4px 0 8px">Quanto mais filmes e séries você avaliar com suas notas, maior a chance do algoritmo acertar nas recomendações.</div>
-      <div class="search-box">
-        <input type="text" placeholder="Buscar por título..." value="${escapeAttr(state.search)}" oninput="__setSearch(this.value)">
-      </div>
-      <div class="hint" style="margin:2px 0 8px">
-        📚 <b style="color:var(--cream)">${state.movies.length}</b> obras no catálogo
-        · 🎬 <b style="color:var(--cream)">${state.movies.filter(m=>(m.type||'movie')!=='series').length}</b> filmes
-        · 📺 <b style="color:var(--cream)">${state.movies.filter(m=>m.type==='series').length}</b> séries
-      </div>
-    </header>
-
+  return `
     <div class="panel">
       <h3>Filtros</h3>
       <label style="margin-top:0">Tipo</label>
@@ -1446,6 +1434,53 @@ function renderMain(){
     <div id="catalog">
       ${catalogListHtml(list)}
     </div>
+  `;
+}
+
+// Redesenha só filtros+ordenar+catálogo (preserva cabeçalho, busca e scroll).
+// Usado por todo toque em chip/select de filtro — evita reconstruir a tela inteira.
+function refreshFiltersAndCatalog(){
+  state.catalogPageSize = 24;
+  const el = document.getElementById('filters-and-catalog');
+  if(el){
+    el.innerHTML = filtersAndCatalogHtml();
+    if(typeof requestIdleCallback === 'function') requestIdleCallback(()=>fillVisibleRecPcts(), { timeout: 400 });
+    else setTimeout(fillVisibleRecPcts, 0);
+  } else {
+    render();
+  }
+}
+
+function renderMain(){
+  app.innerHTML = `
+  <div class="container">
+    <header class="top">
+      <div class="brand">
+        <div>
+          <h1>Cineclube</h1>
+          <small>da Família</small>
+        </div>
+        <div class="identity-pill" onclick="__openSettings()"><span class="dot"></span>${state.me} ⚙︎</div>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-ghost btn-sm" onclick="__openList('priorities')">📋 Prioridades</button>
+        <button class="btn btn-ghost btn-sm" onclick="__openList('watching')">👀 Assistindo</button>
+        <button class="btn btn-ghost btn-sm" onclick="__openList('noted')">📝 Anotados</button>
+      </div>
+      <div class="hint" style="margin:-4px 0 8px">Quanto mais filmes e séries você avaliar com suas notas, maior a chance do algoritmo acertar nas recomendações.</div>
+      <div class="search-box">
+        <input type="text" placeholder="Buscar por título..." value="${escapeAttr(state.search)}" oninput="__setSearch(this.value)">
+      </div>
+      <div class="hint" style="margin:2px 0 8px">
+        📚 <b style="color:var(--cream)">${state.movies.length}</b> obras no catálogo
+        · 🎬 <b style="color:var(--cream)">${state.movies.filter(m=>(m.type||'movie')!=='series').length}</b> filmes
+        · 📺 <b style="color:var(--cream)">${state.movies.filter(m=>m.type==='series').length}</b> séries
+      </div>
+    </header>
+
+    <div id="filters-and-catalog">
+      ${filtersAndCatalogHtml()}
+    </div>
   </div>
   <button class="fab" onclick="__openAdd()">+</button>
   `;
@@ -1491,7 +1526,7 @@ function renderMain(){
         await warmRecCache(list, state.me, null);
       }
     }
-    render();
+    refreshFiltersAndCatalog();
   };
   function refreshCatalogOnly(){
     state.catalogPageSize = 24;
@@ -1502,18 +1537,18 @@ function renderMain(){
     }
   }
   window.__setDir = (v)=>{ state.sortDir=v; refreshCatalogOnly(); };
-  window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; render(); };
-  window.__setStatusWho = (v)=>{ state.filters.statusWho=v; render(); };
-  window.__setMediaType = (v)=>{ state.filters.mediaType=v; render(); };
-  window.__setDecade = (v)=>{ state.filters.decade=v; render(); };
-  window.__setContinent = (v)=>{ state.filters.continent=v; render(); };
-  window.__setLanguage = (v)=>{ state.filters.language=v; render(); };
+  window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; refreshFiltersAndCatalog(); };
+  window.__setStatusWho = (v)=>{ state.filters.statusWho=v; refreshFiltersAndCatalog(); };
+  window.__setMediaType = (v)=>{ state.filters.mediaType=v; refreshFiltersAndCatalog(); };
+  window.__setDecade = (v)=>{ state.filters.decade=v; refreshFiltersAndCatalog(); };
+  window.__setContinent = (v)=>{ state.filters.continent=v; refreshFiltersAndCatalog(); };
+  window.__setLanguage = (v)=>{ state.filters.language=v; refreshFiltersAndCatalog(); };
   window.__toggleGenre = (g)=>{
     const i = state.filters.genres.indexOf(g);
     if(i>=0) state.filters.genres.splice(i,1); else state.filters.genres.push(g);
-    render();
+    refreshFiltersAndCatalog();
   };
-  window.__toggleRatingFilter = ()=>{ state.filters.ratingOn = !state.filters.ratingOn; render(); };
+  window.__toggleRatingFilter = ()=>{ state.filters.ratingOn = !state.filters.ratingOn; refreshFiltersAndCatalog(); };
   window.__setRatingValue = (v)=>{ state.filters.ratingValue = v; refreshCatalogOnly(); };
   window.__setRatingSource = (v)=>{ state.filters.ratingSource = v; refreshCatalogOnly(); };
   window.__openAdd = ()=>{ state.addFlow = {step:'input', url:'', error:null, loading:false, data:null}; render(); };
@@ -1623,7 +1658,7 @@ function showVoteSavedFeedback(){
 
 function renderCard(m){
   const genres = (m.genres||[]).slice(0,3);
-  const posterHtml = posterUrl(m) ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="">` : `<div class="poster-ph">🎬</div>`;
+  const posterHtml = posterUrl(m) ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="" loading="lazy" decoding="async">` : `<div class="poster-ph">🎬</div>`;
   const votesHtml = state.family.members.map(name=>{
     const v = m.votes[name];
     const mine = name === state.me;
