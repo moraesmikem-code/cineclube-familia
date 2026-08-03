@@ -440,9 +440,49 @@ function saveMoviesCache(movies){
   }
 }
 
+const FAMILY_CACHE_KEY = 'cineclube-family-cache-v1';
+function loadFamilyCache(){
+  try{
+    const raw = localStorage.getItem(FAMILY_CACHE_KEY);
+    if(!raw) return null;
+    const p = JSON.parse(raw);
+    if(p && Array.isArray(p.members) && p.members.length) return p;
+  }catch(e){}
+  return null;
+}
+function saveFamilyCache(family){
+  try{
+    if(family && family.members && family.members.length)
+      localStorage.setItem(FAMILY_CACHE_KEY, JSON.stringify(family));
+  }catch(e){}
+}
+// Recupera nomes a partir dos votos/check-ins do catálogo (se a config sumiu)
+function inferFamilyFromMovies(movies){
+  const set = new Set();
+  (movies||[]).forEach(m=>{
+    Object.keys(m.votes||{}).forEach(n=>{ if(n) set.add(n); });
+    Object.keys(m.checkins||{}).forEach(n=>{ if(n) set.add(n); });
+    Object.keys(m.abandonedBy||{}).forEach(n=>{ if(n) set.add(n); });
+  });
+  const members = Array.from(set).filter(Boolean).sort((a,b)=>a.localeCompare(b,'pt-BR'));
+  return members.length ? { members } : null;
+}
 function applyConfigs(results){
   const [fam, key, tmdbKey, lastGeneralUpdate, updateErrorLogRaw, importErrorLogRaw, watchlists, watching, noted, me] = results;
-  if(fam){ try{ state.family = JSON.parse(fam); }catch(e){} }
+  if(fam){
+    try{
+      const parsed = JSON.parse(fam);
+      // Só aplica se veio lista válida; nunca trocar lista completa por lista vazia/mínima
+      if(parsed && Array.isArray(parsed.members) && parsed.members.length){
+        const curLen = (state.family && state.family.members) ? state.family.members.length : 0;
+        // Prefere a lista do servidor se tiver pelo menos tantos membros quanto a local
+        if(parsed.members.length >= curLen || curLen <= 1){
+          state.family = parsed;
+          saveFamilyCache(parsed);
+        }
+      }
+    }catch(e){}
+  }
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
   state.lastGeneralUpdateAt = lastGeneralUpdate || null;
@@ -475,29 +515,46 @@ function refreshMoviesBackground(){
 async function init(){
   // Identidade local imediata
   try{ state.me = localStorage.getItem('my-identity') || null; }catch(e){ state.me = null; }
-  if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
   state.catalogPageSize = 24;
 
-  // Cache local → UI na hora (sem await de rede)
+  // Família: cache local → senão inferir dos filmes → senão placeholder temporário
+  const famCached = loadFamilyCache();
+  if(famCached) state.family = famCached;
+
+  // Cache local de filmes → UI na hora (sem await de rede)
   let cached = null;
   try{ cached = loadMoviesCache(); }catch(e){ cached = null; }
 
   if(cached && cached.length){
     state.movies = cached;
+    if(!state.family || !state.family.members || state.family.members.length <= 1){
+      const inferred = inferFamilyFromMovies(cached);
+      if(inferred) { state.family = inferred; saveFamilyCache(inferred); }
+    }
+    if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
     state.booted = true;
     render();
-    // Cede o thread para o browser pintar antes de qualquer rede
     await new Promise(r => setTimeout(r, 0));
 
-    // Rede só em background — NÃO await
     Promise.all([
       sGet('family-config', true), sGet('omdb-key', true), sGet('tmdb-key', true),
       sGet('last-general-update', true), sGet('update-error-log', true), sGet('import-error-log', true),
       sGet('watchlists-v1', true), sGet('watching-v1', true), sGet('noted-v1', true),
       sGet('my-identity', false)
-    ]).then(applyConfigs).then(()=>{ if(state.booted) render(); }).catch(()=>{});
+    ]).then(results=>{
+      applyConfigs(results);
+      // Se o servidor veio com poucos membros mas o catálogo tem mais nomes, mescla
+      const inferred = inferFamilyFromMovies(state.movies);
+      if(inferred && inferred.members.length > (state.family.members||[]).length){
+        const merged = Array.from(new Set([...(state.family.members||[]), ...inferred.members]));
+        state.family = { members: merged };
+        saveFamilyCache(state.family);
+        // Grava de volta no Firestore para restaurar
+        sSet('family-config', JSON.stringify(state.family), true).catch(()=>{});
+      }
+      if(state.booted) render();
+    }).catch(()=>{});
 
-    // Atrasa um pouco o getDocs pesado para não competir com a 1ª pintura
     setTimeout(refreshMoviesBackground, 600);
     return;
   }
@@ -1176,8 +1233,9 @@ function renderFamilySetup(){
       return;
     }
     const family = { members:[n1,n2,n3] };
-    await sSet('family-config', JSON.stringify(family), true);
     state.family = family;
+    saveFamilyCache(family);
+    await sSet('family-config', JSON.stringify(family), true);
     render();
   };
 }
@@ -2245,9 +2303,10 @@ function renderSettingsModal(){
     document.getElementById('tmdb-key-msg').innerHTML = res.ok ? `<div class="msg-ok">Chave salva!</div>` : `<div class="msg-error">Erro: ${escapeHtml(res.error)}</div>`;
   };
   window.__saveMembers = async ()=>{
-    const names = fam.members.map((_,i)=>document.getElementById('mem-'+i).value.trim());
-    if(names.some(n=>!n)) return;
+    const names = fam.members.map((_,i)=>document.getElementById('mem-'+i).value.trim()).filter(Boolean);
+    if(names.length < 1) return;
     state.family = { members: names };
+    saveFamilyCache(state.family);
     await sSet('family-config', JSON.stringify(state.family), true);
     render();
   };
