@@ -400,43 +400,79 @@ const LIST_TYPES = {
 };
 
 const MOVIES_CACHE_KEY = 'cineclube-movies-cache-v1';
+const IDB_NAME = 'cineclube-db';
+const IDB_STORE = 'kv';
+
+function slimMovie(m){
+  return {
+    id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
+    titleEn:m.titleEn, year:m.year, poster:m.poster, posterCustom:m.posterCustom,
+    director:m.director, writer:m.writer, actors:m.actors, genres:m.genres,
+    runtimeMin:m.runtimeMin, releaseDate:m.releaseDate, countries:m.countries,
+    languages:m.languages, primaryLanguage:m.primaryLanguage, production:m.production,
+    ratings:m.ratings, votes:m.votes, checkins:m.checkins, addedAt:m.addedAt,
+    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, keywords:m.keywords, hiddenBy:m.hiddenBy
+  };
+}
+
+function idbOpen(){
+  return new Promise((resolve, reject)=>{
+    if(!window.indexedDB){ reject(new Error('no idb')); return; }
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = ()=>{
+      const db = req.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+function idbGet(key){
+  return idbOpen().then(db=> new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = ()=> resolve(req.result ?? null);
+    req.onerror = ()=> reject(req.error);
+  })).catch(()=> null);
+}
+function idbSet(key, value){
+  return idbOpen().then(db=> new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = ()=> resolve(true);
+    tx.onerror = ()=> reject(tx.error);
+  })).catch(()=> false);
+}
 
 function loadMoviesCache(){
+  // Síncrono: só localStorage (fallback rápido na 1ª pintura)
   try{
     const raw = localStorage.getItem(MOVIES_CACHE_KEY);
     if(!raw) return null;
     const parsed = JSON.parse(raw);
     if(parsed && Array.isArray(parsed.movies) && parsed.movies.length) return parsed.movies;
-  }catch(e){ /* quota / parse */ }
+  }catch(e){}
   return null;
 }
-function saveMoviesCache(movies){
-  // Sempre grava versão enxuta: abre bem mais rápido (~6000 títulos).
-  // Sinopse/keywords/temporadas vêm do Firestore em background.
+async function loadMoviesCacheAsync(){
+  // IndexedDB primeiro (suporta catálogo grande sem travar o parse do localStorage)
   try{
-    const slim = movies.map(m=>({
-      id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
-      titleEn:m.titleEn, year:m.year, poster:m.poster, posterCustom:m.posterCustom,
-      director:m.director, writer:m.writer,
-      actors:m.actors, genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
-      countries:m.countries, languages:m.languages, primaryLanguage:m.primaryLanguage,
-      production:m.production, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
-      addedAt:m.addedAt, dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy,
-      keywords:m.keywords // útil pro algoritmo; listas curtas
-    }));
-    localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim, slim:true }));
+    const fromIdb = await idbGet('movies');
+    if(fromIdb && Array.isArray(fromIdb.movies) && fromIdb.movies.length) return fromIdb.movies;
+  }catch(e){}
+  return loadMoviesCache();
+}
+function saveMoviesCache(movies){
+  const slim = movies.map(slimMovie);
+  const payload = { savedAt: Date.now(), movies: slim, slim:true };
+  // IndexedDB em background (não bloqueia UI)
+  idbSet('movies', payload);
+  // localStorage enxuto só com os primeiros N para boot emergencial
+  try{
+    const boot = slim.slice(0, 80);
+    localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: boot, slim:true, partial:true }));
   }catch(e){
-    try{
-      // Ainda maior: tira keywords também
-      const slim2 = movies.map(m=>({
-        id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
-        titleEn:m.titleEn, year:m.year, poster:m.poster, director:m.director,
-        genres:m.genres, runtimeMin:m.runtimeMin, releaseDate:m.releaseDate,
-        countries:m.countries, ratings:m.ratings, votes:m.votes, checkins:m.checkins,
-        addedAt:m.addedAt
-      }));
-      localStorage.setItem(MOVIES_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), movies: slim2, slim:true }));
-    }catch(e2){ /* desiste do cache */ }
+    try{ localStorage.removeItem(MOVIES_CACHE_KEY); }catch(e2){}
   }
 }
 
@@ -521,9 +557,12 @@ async function init(){
   const famCached = loadFamilyCache();
   if(famCached) state.family = famCached;
 
-  // Cache local de filmes → UI na hora (sem await de rede)
+  // Cache: tenta IndexedDB (completo) → localStorage (parcial de emergência)
   let cached = null;
-  try{ cached = loadMoviesCache(); }catch(e){ cached = null; }
+  try{ cached = await loadMoviesCacheAsync(); }catch(e){ cached = null; }
+  if(!cached || !cached.length){
+    try{ cached = loadMoviesCache(); }catch(e){ cached = null; }
+  }
 
   if(cached && cached.length){
     state.movies = cached;
@@ -543,19 +582,17 @@ async function init(){
       sGet('my-identity', false)
     ]).then(results=>{
       applyConfigs(results);
-      // Se o servidor veio com poucos membros mas o catálogo tem mais nomes, mescla
       const inferred = inferFamilyFromMovies(state.movies);
       if(inferred && inferred.members.length > (state.family.members||[]).length){
         const merged = Array.from(new Set([...(state.family.members||[]), ...inferred.members]));
         state.family = { members: merged };
         saveFamilyCache(state.family);
-        // Grava de volta no Firestore para restaurar
         sSet('family-config', JSON.stringify(state.family), true).catch(()=>{});
       }
-      if(state.booted) render();
+      if(state.booted && !state.modalMovie) render();
     }).catch(()=>{});
 
-    setTimeout(refreshMoviesBackground, 600);
+    setTimeout(refreshMoviesBackground, 800);
     return;
   }
 
@@ -1164,7 +1201,7 @@ function catalogListHtml(list){
         <p>Toque no botão dourado para colar o link de um filme do IMDb e começar o catálogo da família.</p>
       </div>`;
   }
-  if(!state.catalogPageSize) state.catalogPageSize = 30;
+  if(!state.catalogPageSize) state.catalogPageSize = 24;
   const pageSize = state.catalogPageSize;
   const visible = list.slice(0, pageSize);
   let html = visible.map(renderCard).join('');
@@ -1173,10 +1210,37 @@ function catalogListHtml(list){
   }
   return html;
 }
+function fillVisibleRecPcts(){
+  const nodes = document.querySelectorAll('#catalog [data-rec-id]');
+  if(!nodes.length) return;
+  const arr = Array.from(nodes);
+  let i = 0;
+  const step = ()=>{
+    const end = Math.min(i + 8, arr.length);
+    for(; i < end; i++){
+      const el = arr[i];
+      const id = el.getAttribute('data-rec-id');
+      const movie = state.movies.find(x => x.id === id);
+      if(!movie){ el.textContent = ''; continue; }
+      try{
+        const pct = getAffinityPct(movie, state.me);
+        el.innerHTML = pct >= 0 ? `Recomendação: <b style="color:var(--gold)">${pct}%</b>` : '';
+      }catch(e){ el.textContent = ''; }
+    }
+    if(i < arr.length){
+      if(typeof requestIdleCallback === 'function') requestIdleCallback(step, { timeout: 180 });
+      else setTimeout(step, 0);
+    }
+  };
+  step();
+}
 window.__loadMoreCatalog = ()=>{
-  state.catalogPageSize = (state.catalogPageSize||30) + 30;
+  state.catalogPageSize = (state.catalogPageSize||24) + 24;
   const el = document.getElementById('catalog');
-  if(el) el.innerHTML = catalogListHtml(getFilteredSorted());
+  if(el){
+    el.innerHTML = catalogListHtml(getFilteredSorted());
+    fillVisibleRecPcts();
+  }
 };
 
 /* ---------- RENDER ---------- */
@@ -1385,11 +1449,23 @@ function renderMain(){
   </div>
   <button class="fab" onclick="__openAdd()">+</button>
   `;
+  // % de recomendação em idle (não trava a 1ª pintura)
+  if(typeof requestIdleCallback === 'function') requestIdleCallback(()=>fillVisibleRecPcts(), { timeout: 400 });
+  else setTimeout(fillVisibleRecPcts, 0);
 
+  let _searchTimer = null;
   window.__setSearch = (v)=>{
     state.search = v;
-    const el = document.getElementById('catalog');
-    if(el) el.innerHTML = catalogListHtml(getFilteredSorted());
+    // Debounce: não recalcula a cada tecla
+    if(_searchTimer) clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(()=>{
+      const el = document.getElementById('catalog');
+      if(el){
+        state.catalogPageSize = 24;
+        el.innerHTML = catalogListHtml(getFilteredSorted());
+        fillVisibleRecPcts();
+      }
+    }, 180);
   };
   window.__setSort = async (v)=>{
     state.sortField = v;
@@ -1417,7 +1493,15 @@ function renderMain(){
     }
     render();
   };
-  window.__setDir = (v)=>{ state.sortDir=v; render(); };
+  function refreshCatalogOnly(){
+    state.catalogPageSize = 24;
+    const el = document.getElementById('catalog');
+    if(el){
+      el.innerHTML = catalogListHtml(getFilteredSorted());
+      fillVisibleRecPcts();
+    }
+  }
+  window.__setDir = (v)=>{ state.sortDir=v; refreshCatalogOnly(); };
   window.__setStatus = (v)=>{ state.filters.status=v; if(!state.filters.statusWho) state.filters.statusWho='all'; render(); };
   window.__setStatusWho = (v)=>{ state.filters.statusWho=v; render(); };
   window.__setMediaType = (v)=>{ state.filters.mediaType=v; render(); };
@@ -1430,12 +1514,17 @@ function renderMain(){
     render();
   };
   window.__toggleRatingFilter = ()=>{ state.filters.ratingOn = !state.filters.ratingOn; render(); };
-  window.__setRatingValue = (v)=>{ state.filters.ratingValue = v; render(); };
-  window.__setRatingSource = (v)=>{ state.filters.ratingSource = v; render(); };
+  window.__setRatingValue = (v)=>{ state.filters.ratingValue = v; refreshCatalogOnly(); };
+  window.__setRatingSource = (v)=>{ state.filters.ratingSource = v; refreshCatalogOnly(); };
   window.__openAdd = ()=>{ state.addFlow = {step:'input', url:'', error:null, loading:false, data:null}; render(); };
   window.__openSettings = ()=>{ state.settingsOpen = true; render(); };
   window.__openList = (listKey)=>{ state.listOpen = listKey; render(); };
-  window.__openMovie = (id)=>{ state.modalMovie = id; render(); };
+  window.__openMovie = (id)=>{
+    state.modalMovie = id;
+    // Só o modal — não redesenha o catálogo
+    removeOverlays();
+    renderMovieModal(id);
+  };
 }
 
 function ratingChip(label, val, scale){
@@ -1563,7 +1652,7 @@ function renderCard(m){
         ${ratingChip('IMDb', m.ratings && m.ratings.imdb)}
         ${ratingChip('RT', m.ratings && m.ratings.rtCritics)}
         ${ratingChip('Metacritic', m.ratings && m.ratings.metacritic)}
-        ${(()=>{ const pct=getAffinityPct(m,state.me); return pct>=0 ? `<span>Recomendação: <b style="color:var(--gold)">${pct}%</b></span>` : ''; })()}
+        <span data-rec-id="${m.id}">Recomendação: …</span>
       </div>
       ${checkinHtml}
       <div class="perf"></div>
@@ -2114,7 +2203,12 @@ function renderMovieModal(id){
     state.modalMovie = null;
     render();
   };
-  window.__closeMovie = ()=>{ state.modalMovie=null; render(); };
+  window.__closeMovie = ()=>{
+    state.modalMovie = null;
+    const el = document.getElementById('movie-overlay');
+    if(el) el.remove();
+    // Catálogo continua como estava — zero re-render
+  };
 }
 
 /* ---------- SETTINGS MODAL ---------- */
