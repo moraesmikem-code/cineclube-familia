@@ -592,6 +592,10 @@ function refreshMoviesBackground(){
   // Nunca trava a UI: atualiza quando der e grava cache no idle
   const lastSync = getLastSyncAt();
   const syncStartedAt = Date.now();
+  // Re-sincroniza o worker depois de merge (chamado ao final dos ramos abaixo via scheduleWorkerReinit)
+  function scheduleWorkerReinit(){
+    setTimeout(()=>{ try{ initRecWorkerData(); }catch(e){} }, 300);
+  }
 
   if(lastSync == null){
     // Sem marca de sync ainda (1ª vez com esta versão, ou cache antigo de antes da
@@ -604,6 +608,7 @@ function refreshMoviesBackground(){
       const save = ()=>{ try{ saveMoviesCache(movies); }catch(e){} };
       if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 3000 });
       else setTimeout(save, 400);
+      scheduleWorkerReinit();
       if(!state.modalMovie && !state.addFlow && !state.settingsOpen && !state.importOpen){
         render();
       }
@@ -631,6 +636,7 @@ function refreshMoviesBackground(){
     const save = ()=>{ try{ saveMoviesCache(merged); }catch(e){} };
     if(typeof requestIdleCallback === 'function') requestIdleCallback(save, { timeout: 3000 });
     else setTimeout(save, 400);
+    scheduleWorkerReinit();
     if(!state.modalMovie && !state.addFlow && !state.settingsOpen && !state.importOpen){
       render();
     }
@@ -662,6 +668,8 @@ async function init(){
     if(!state.family) state.family = { members: state.me ? [state.me] : ['Eu'] };
     state.booted = true;
     render();
+    // Sobe o Worker em paralelo (recomendações fora da main thread)
+    try{ initRecWorkerData(); }catch(e){}
     await new Promise(r => setTimeout(r, 0));
 
     Promise.all([
@@ -723,6 +731,7 @@ async function init(){
   }
   state.booted = true;
   render();
+  try{ initRecWorkerData(); }catch(e){}
 }
 
 /* ---------- IMDB / OMDB / TMDB ---------- */
@@ -1193,6 +1202,108 @@ function getFilteredListOnly(){
 // Cache de % de recomendação: sobrevive entre ordenações até o usuário avaliar mais filmes
 let _recPctCache = { key: '', map: new Map() };
 
+/* ---------- WEB WORKER DE RECOMENDAÇÃO ---------- */
+let _recWorker = null;
+let _recWorkerReady = false;
+let _recWorkerInitGen = 0;
+function ensureRecWorker(){
+  if(_recWorker) return _recWorker;
+  if(typeof Worker === 'undefined') return null;
+  try{
+    _recWorker = new Worker('./worker.js');
+    _recWorker.onmessage = (e)=>{
+      const msg = e.data || {};
+      if(msg.type === 'READY'){
+        _recWorkerReady = true;
+      } else if(msg.type === 'ERROR'){
+        console.error('rec worker error', msg.message);
+      }
+    };
+    _recWorker.onerror = (err)=>{
+      console.error('rec worker failed', err);
+      _recWorkerReady = false;
+      try{ _recWorker.terminate(); }catch(e){}
+      _recWorker = null;
+    };
+  }catch(e){
+    console.error('não foi possível criar worker', e);
+    _recWorker = null;
+  }
+  return _recWorker;
+}
+function slimMoviesForWorker(list){
+  return (list||[]).map(m=>({
+    id:m.id, imdbId:m.imdbId, type:m.type,
+    titlePt:m.titlePt, titleOriginal:m.titleOriginal, titleEn:m.titleEn, title:m.title,
+    year:m.year, director:m.director, writer:m.writer, actors:m.actors,
+    genres:m.genres, countries:m.countries, production:m.production,
+    runtimeMin:m.runtimeMin, keywords:m.keywords,
+    ratings:m.ratings, votes:m.votes, checkins:m.checkins,
+    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy,
+    synopsisPt:m.synopsisPt, plot:m.plot, seasons:m.seasons, episodeVotes:m.episodeVotes
+  }));
+}
+function initRecWorkerData(){
+  const w = ensureRecWorker();
+  if(!w) return;
+  _recWorkerReady = false;
+  _recWorkerInitGen++;
+  const gen = _recWorkerInitGen;
+  w.postMessage({
+    type: 'INIT',
+    movies: slimMoviesForWorker(state.movies),
+    family: state.family,
+    me: state.me
+  });
+  // READY chega no onmessage
+  void gen;
+}
+function notifyWorkerMovieUpdated(movie){
+  const w = ensureRecWorker();
+  if(!w || !movie) return;
+  try{
+    w.postMessage({ type: 'UPDATE_MOVIE', movie: slimMoviesForWorker([movie])[0] });
+  }catch(e){}
+}
+function computeAllViaWorker(person, onProgress){
+  return new Promise((resolve, reject)=>{
+    const w = ensureRecWorker();
+    if(!w){ reject(new Error('no worker')); return; }
+    const handler = (e)=>{
+      const msg = e.data || {};
+      if(msg.type === 'PROGRESS' && onProgress){
+        onProgress(msg.done, msg.total);
+        return;
+      }
+      if(msg.type === 'RESULTS'){
+        w.removeEventListener('message', handler);
+        resolve(msg.data || {});
+      } else if(msg.type === 'ERROR'){
+        w.removeEventListener('message', handler);
+        reject(new Error(msg.message || 'worker error'));
+      }
+    };
+    w.addEventListener('message', handler);
+    // Garante INIT antes do compute
+    if(!_recWorkerReady){
+      initRecWorkerData();
+      const waitReady = (e2)=>{
+        if(e2.data && e2.data.type === 'READY'){
+          w.removeEventListener('message', waitReady);
+          w.postMessage({ type: 'COMPUTE_ALL', person });
+        }
+      };
+      w.addEventListener('message', waitReady);
+      // timeout de segurança
+      setTimeout(()=>{
+        try{ w.postMessage({ type: 'COMPUTE_ALL', person }); }catch(e){}
+      }, 800);
+    } else {
+      w.postMessage({ type: 'COMPUTE_ALL', person });
+    }
+  });
+}
+
 function ratedCountFor(person){
   let n = 0;
   for(let i=0;i<state.movies.length;i++){
@@ -1202,8 +1313,8 @@ function ratedCountFor(person){
   return n;
 }
 function ensureRecCacheBucket(person){
-  // "v11" no key força recalcular depois da mudança de fórmula
-  const key = 'v11:' + person + ':' + ratedCountFor(person);
+  // "v12" no key: worker + fórmula atual
+  const key = 'v12:' + person + ':' + ratedCountFor(person);
   if(_recPctCache.key !== key){
     _recPctCache = { key, map: new Map() };
   }
@@ -1220,7 +1331,7 @@ function getAffinityPct(movie, person){
   map.set(movie.id, pct);
   return pct;
 }
-// Preenche o cache em fatias para não travar a UI
+// Preenche o cache: Worker (fora da main thread) → fallback em fatias na UI
 async function warmRecCache(list, person, onProgress){
   const map = ensureRecCacheBucket(person);
   const missing = [];
@@ -1231,12 +1342,35 @@ async function warmRecCache(list, person, onProgress){
     if(onProgress) onProgress(0, 0);
     return;
   }
-  const CHUNK = 120;
+
+  // Tenta Worker (calcula o catálogo inteiro sem travar a UI)
+  if(typeof Worker !== 'undefined'){
+    try{
+      ensureRecWorker();
+      if(!_recWorkerReady) initRecWorkerData();
+      const results = await computeAllViaWorker(person, onProgress);
+      if(results && typeof results === 'object'){
+        Object.keys(results).forEach(id=>{
+          map.set(id, results[id]);
+        });
+        // preenche missing que por algum motivo não vieram
+        for(let j=0;j<missing.length;j++){
+          if(!map.has(missing[j].id)) map.set(missing[j].id, -1);
+        }
+        if(onProgress) onProgress(missing.length, missing.length);
+        return;
+      }
+    }catch(e){
+      console.warn('worker fallback para main thread', e);
+    }
+  }
+
+  // Fallback: fatias na main thread
+  const CHUNK = 80;
   for(let i=0;i<missing.length;i+=CHUNK){
     const end = Math.min(i+CHUNK, missing.length);
     for(let j=i;j<end;j++) getAffinityPct(missing[j], person);
     if(onProgress) onProgress(end, missing.length);
-    // Cede o thread para a UI respirar
     await new Promise(r => setTimeout(r, 0));
   }
 }
@@ -2399,6 +2533,7 @@ function renderMovieModal(id){
       _profileCache = {};
       if(typeof _recPctCache !== 'undefined') _recPctCache = { key:null, map:{} };
     }catch(e){}
+    try{ notifyWorkerMovieUpdated(m); }catch(e){}
     // Só modal + card — sem render() do catálogo
     patchVoteUI(m, state.me);
     showVoteSavedFeedback();
