@@ -1,8 +1,9 @@
 /* Cineclube — Service Worker (cache de assets estáticos) */
-const CACHE = 'cineclube-static-v2';
+const CACHE = 'cineclube-static-v3';
 const PRECACHE = [
   './',
   './index.html',
+  './worker.js',
   './manifest.json',
   './icon-192.png'
 ];
@@ -54,6 +55,20 @@ self.addEventListener('fetch', (event) => {
           return res;
         })
         .catch(() => caches.match(event.request).then((r) => r || caches.match('./index.html')))
+    );
+    return;
+  }
+
+  // worker.js e outros JS do app: network-first (pega versão nova, fallback cache)
+  if (url.pathname.endsWith('/worker.js') || url.pathname.endsWith('worker.js') || url.pathname.endsWith('.js')) {
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});
+          return res;
+        })
+        .catch(() => caches.match(event.request))
     );
     return;
   }
