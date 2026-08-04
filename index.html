@@ -434,7 +434,8 @@ const IDB_NAME = 'cineclube-db';
 const IDB_STORE = 'kv';
 
 function slimMovie(m){
-  // Mantém sinopse/elenco/roteiro no cache — senão o modal fica vazio na abertura offline
+  // Lazy agressivo: cache local só com o essencial da lista + algoritmo.
+  // Sinopse, temporadas, streaming etc. vêm do Firestore em memória ou soft-fill no modal.
   return {
     id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
     titleEn:m.titleEn, year:m.year, poster:m.poster, posterCustom:m.posterCustom,
@@ -442,11 +443,10 @@ function slimMovie(m){
     runtimeMin:m.runtimeMin, releaseDate:m.releaseDate, countries:m.countries,
     languages:m.languages, primaryLanguage:m.primaryLanguage, production:m.production,
     ratings:m.ratings, votes:m.votes, checkins:m.checkins, addedAt:m.addedAt, updatedAt:m.updatedAt,
-    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, keywords:m.keywords, hiddenBy:m.hiddenBy,
+    dismissedBy:m.dismissedBy, keywords:m.keywords, hiddenBy:m.hiddenBy,
     trainingOnly: !!m.trainingOnly,
-    synopsisPt:m.synopsisPt, plot:m.plot, synopsisAuto:m.synopsisAuto,
-    tmdbId:m.tmdbId, releaseStatus:m.releaseStatus, nextEpisode:m.nextEpisode,
-    seasons:m.seasons, theatricalBR:m.theatricalBR, streaming:m.streaming
+    tmdbId:m.tmdbId
+    // propositalmente omitidos no cache: synopsisPt, plot, seasons, streaming, theatricalBR, abandonedBy, episodeVotes
   };
 }
 function topActors(m, n=5){
@@ -1236,16 +1236,52 @@ function ensureRecWorker(){
   return _recWorker;
 }
 function slimMoviesForWorker(list){
-  return (list||[]).map(m=>({
-    id:m.id, imdbId:m.imdbId, type:m.type,
-    titlePt:m.titlePt, titleOriginal:m.titleOriginal, titleEn:m.titleEn, title:m.title,
-    year:m.year, director:m.director, writer:m.writer, actors:m.actors,
-    genres:m.genres, countries:m.countries, production:m.production,
-    runtimeMin:m.runtimeMin, keywords:m.keywords,
-    ratings:m.ratings, votes:m.votes, checkins:m.checkins,
-    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, trainingOnly: !!m.trainingOnly,
-    synopsisPt:m.synopsisPt, plot:m.plot, seasons:m.seasons, episodeVotes:m.episodeVotes
-  }));
+  // Só o que o algoritmo de afinidade usa (sem poster, streaming, temporadas…)
+  return (list||[]).map(m=>{
+    const r = m.ratings || {};
+    const votes = {};
+    if(m.votes){
+      Object.keys(m.votes).forEach(name=>{
+        const v = m.votes[name];
+        if(v && v.score!=null) votes[name] = { score: v.score };
+      });
+    }
+    const checkins = {};
+    if(m.checkins){
+      Object.keys(m.checkins).forEach(name=>{
+        if(m.checkins[name]) checkins[name] = m.checkins[name];
+      });
+    }
+    const abandonedBy = {};
+    if(m.abandonedBy){
+      Object.keys(m.abandonedBy).forEach(name=>{
+        if(m.abandonedBy[name]) abandonedBy[name] = m.abandonedBy[name];
+      });
+    }
+    return {
+      id: m.id,
+      imdbId: m.imdbId,
+      titlePt: m.titlePt, titleOriginal: m.titleOriginal, titleEn: m.titleEn, title: m.title,
+      year: m.year,
+      director: m.director, writer: m.writer, actors: m.actors,
+      genres: m.genres || [],
+      countries: m.countries || [],
+      production: m.production || '',
+      keywords: m.keywords || [],
+      ratings: {
+        imdb: r.imdb != null ? r.imdb : null,
+        imdbVotes: r.imdbVotes != null ? r.imdbVotes : null,
+        rtCritics: r.rtCritics != null ? r.rtCritics : null,
+        metacritic: r.metacritic != null ? r.metacritic : null
+      },
+      votes,
+      checkins,
+      dismissedBy: m.dismissedBy || [],
+      abandonedBy,
+      synopsisPt: m.synopsisPt ? String(m.synopsisPt).slice(0, 400) : '',
+      plot: m.plot ? String(m.plot).slice(0, 400) : ''
+    };
+  });
 }
 function initRecWorkerData(){
   const w = ensureRecWorker();
@@ -1324,9 +1360,23 @@ function ensureRecCacheBucket(person){
   }
   return _recPctCache.map;
 }
-function getAffinityPct(movie, person){
+// Já assistiu / avaliou → na ordenação por recomendação não precisa de %
+function isSeenBy(movie, person){
+  if(!movie || !person) return false;
+  const v = movie.votes && movie.votes[person];
+  if(v && v.score != null) return true;
+  if(movie.checkins && movie.checkins[person]) return true;
+  if(movie.abandonedBy && movie.abandonedBy[person]) return true;
+  return false;
+}
+function getAffinityPct(movie, person, opts){
   const map = ensureRecCacheBucket(person);
   if(map.has(movie.id)) return map.get(movie.id);
+  // Ordenação: não calcula % de já assistidos (vão para o fim com -1)
+  if(opts && opts.skipSeen && isSeenBy(movie, person)){
+    map.set(movie.id, -1);
+    return -1;
+  }
   let pct = -1;
   try{
     const rec = estimateAffinity(movie, person);
@@ -1335,19 +1385,22 @@ function getAffinityPct(movie, person){
   map.set(movie.id, pct);
   return pct;
 }
-// Preenche o cache: Worker (fora da main thread) → fallback em fatias na UI
+// Preenche o cache: só títulos NÃO assistidos (ordenação por recomendação)
 async function warmRecCache(list, person, onProgress){
   const map = ensureRecCacheBucket(person);
   const missing = [];
   for(let i=0;i<list.length;i++){
-    if(!map.has(list[i].id)) missing.push(list[i]);
+    const m = list[i];
+    if(map.has(m.id)) continue;
+    if(isSeenBy(m, person)){ map.set(m.id, -1); continue; }
+    missing.push(m);
   }
   if(missing.length === 0){
     if(onProgress) onProgress(0, 0);
     return;
   }
 
-  // Tenta Worker (calcula o catálogo inteiro sem travar a UI)
+  // Worker: calcula; na main marcamos vistos como -1
   if(typeof Worker !== 'undefined'){
     try{
       ensureRecWorker();
@@ -1355,9 +1408,10 @@ async function warmRecCache(list, person, onProgress){
       const results = await computeAllViaWorker(person, onProgress);
       if(results && typeof results === 'object'){
         Object.keys(results).forEach(id=>{
-          map.set(id, results[id]);
+          const m = state.movies.find(x => x.id === id);
+          if(m && isSeenBy(m, person)) map.set(id, -1);
+          else map.set(id, results[id]);
         });
-        // preenche missing que por algum motivo não vieram
         for(let j=0;j<missing.length;j++){
           if(!map.has(missing[j].id)) map.set(missing[j].id, -1);
         }
@@ -1369,7 +1423,7 @@ async function warmRecCache(list, person, onProgress){
     }
   }
 
-  // Fallback: fatias na main thread
+  // Fallback: fatias na main thread (só unwatched)
   const CHUNK = 80;
   for(let i=0;i<missing.length;i+=CHUNK){
     const end = Math.min(i+CHUNK, missing.length);
@@ -1382,12 +1436,12 @@ async function warmRecCache(list, person, onProgress){
 function sortMovieList(list, field, dir){
   const dirMul = dir === 'asc' ? 1 : -1;
 
-  // Usa cache de recomendações (já aquecido ou sob demanda)
+  // Usa cache de recomendações — não força cálculo em já assistidos
   let recMap = null;
   if(field === 'recommendation'){
     recMap = ensureRecCacheBucket(state.me);
     for(const m of list){
-      if(!recMap.has(m.id)) getAffinityPct(m, state.me);
+      if(!recMap.has(m.id)) getAffinityPct(m, state.me, { skipSeen: true });
     }
   }
 
@@ -1856,9 +1910,9 @@ function patchVoteUI(movie, person){
   if(allVotes && state.family && state.family.members){
     const lines = state.family.members.map(name=>{
       const vv = movie.votes[name];
-      const has = vv && (vv.score!=null || vv.liked!=null);
+      const has = vv && vv.score!=null;
       const icon = !has ? '<span class="vote-empty">sem voto ainda</span>' :
-        `${likedIcon(vv.liked)} ${vv.score!=null?'<b style="color:var(--gold)">'+vv.score+'/10</b>':''}`;
+        `<b style="color:var(--gold)">${vv.score}/10</b>`;
       return `<div class="vote-line"><span>${name}</span><span>${icon}</span></div>`;
     }).join('');
     const avg = familyAvg(movie);
@@ -1889,12 +1943,10 @@ function patchVoteUI(movie, person){
         votesRow.innerHTML = state.family.members.map(name=>{
           const vv = movie.votes[name];
           const mine = name === state.me;
-          if(!vv || (vv.score==null && vv.liked==null)){
+          if(!vv || vv.score==null){
             return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="vote-empty">sem voto</span></div>`;
           }
-          const likeIcon = `<span>${likedIcon(vv.liked)}</span>`;
-          const scoreTxt = vv.score!=null ? `<span class="score">${vv.score}</span>` : '';
-          return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span>${likeIcon}${scoreTxt}</div>`;
+          return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="score">${vv.score}</span></div>`;
         }).join('');
       }
       const cRow = ticket.querySelector('.checkin-row');
@@ -1937,12 +1989,10 @@ function renderCard(m){
   const votesHtml = state.family.members.map(name=>{
     const v = m.votes[name];
     const mine = name === state.me;
-    if(!v || (v.score==null && v.liked==null)){
+    if(!v || v.score==null){
       return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="vote-empty">sem voto</span></div>`;
     }
-    const likeIcon = `<span>${likedIcon(v.liked)}</span>`;
-    const scoreTxt = v.score!=null ? `<span class="score">${v.score}</span>` : '';
-    return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span>${likeIcon}${scoreTxt}</div>`;
+    return `<div class="vote-badge ${mine?'mine':''}"><span class="name">${name}</span><span class="score">${v.score}</span></div>`;
   }).join('');
   const checkinHtml = `<div class="checkin-row">${state.family.members.map(name=>{
     const done = m.checkins && m.checkins[name];
@@ -2211,15 +2261,16 @@ function renderMovieModal(id){
         <button class="btn btn-ghost btn-sm" style="flex:1" onclick="__refreshExternalData('${m.id}')">🔄 Atualizar (OMDb)</button>
       </div>
 
+      ${m.type==='series' ? `
       <div class="panel" style="margin:12px 0">
         <h3 style="font-size:16px">📡 Novidades e Streaming</h3>
         ${renderReleaseAlert(m)}
         ${renderStreamingLogos(m)}
-        <p class="hint" style="margin:6px 0 0">Esse botão verifica: nova data de estreia (cinema no Brasil ou streaming mundial), novas temporadas/episódios (se for série), e em quais streamings está disponível no Brasil agora.</p>
+        <p class="hint" style="margin:6px 0 0">Verifica novas temporadas/episódios e em quais streamings a série está disponível no Brasil.</p>
         <button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__refreshDetailedData('${m.id}')">🔄 Verificar novidades</button>
         <div class="hint" style="margin-top:6px">${m.lastUpdatedAt ? 'Última atualização: '+new Date(m.lastUpdatedAt).toLocaleString('pt-BR') : 'Ainda não verificado — toque no botão acima pra buscar.'}</div>
-        ${m.type==='series' && m.tmdbId ? `<button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__openEpisodeTracker('${m.id}')">📺 Ver e marcar episódios</button>` : ''}
-      </div>
+        ${m.tmdbId ? `<button class="btn btn-ghost btn-block" style="margin-top:8px" onclick="__openEpisodeTracker('${m.id}')">📺 Ver e marcar episódios</button>` : ''}
+      </div>` : ''}
       ${(()=>{
         const myV = m.votes[state.me];
         const r=estimateAffinity(m,state.me);
@@ -2276,30 +2327,8 @@ function renderMovieModal(id){
       </div>
 
       <div class="vote-editor">
-        <h4>Abandono</h4>
-        <div class="hint" style="margin-top:0">Se você começou e desistiu no meio, isso vira um sinal negativo no algoritmo (mais forte se parou cedo).</div>
-        ${(()=>{
-          const ab = m.abandonedBy && m.abandonedBy[state.me];
-          if(ab){
-            return `<div class="hint" style="margin:8px 0">Você marcou abandono em ${new Date(ab.at).toLocaleDateString('pt-BR')}${ab.pctWatched!=null?' · ~'+ab.pctWatched+'% assistido':''}.</div>
-            <button class="btn btn-ghost btn-block" onclick="__clearAbandon('${m.id}')">Desfazer abandono</button>`;
-          }
-          const seriesPct = (m.type==='series') ? seriesProgressPct(m, state.me) : null;
-          return `
-          <label>Quanto % você chegou a assistir? (opcional)</label>
-          <input type="number" min="1" max="99" id="abandon-pct" value="${seriesPct != null ? seriesPct : 25}" placeholder="ex: 20">
-          <button class="btn btn-ghost btn-block" style="margin-top:8px;border-color:var(--dislike);color:var(--dislike)" onclick="__markAbandon('${m.id}')">⏹ Marcar que desisti / abandonei</button>`;
-        })()}
-      </div>
-
-      <div class="vote-editor">
         <h4>Seu voto (${state.me})</h4>
-        <div class="like-toggle">
-          <button id="btn-like" class="${(normalizeLiked(myVote.liked) || classifyByScore(myVote.score ?? 5))==='like'?'on-like':''}" onclick="__setLiked('like')">👍 Gostei</button>
-          <button id="btn-neutral" class="${(normalizeLiked(myVote.liked) || classifyByScore(myVote.score ?? 5))==='neutral'?'on-neutral':''}" onclick="__setLiked('neutral')">😐 Mediano</button>
-          <button id="btn-dislike" class="${(normalizeLiked(myVote.liked) || classifyByScore(myVote.score ?? 5))==='dislike'?'on-dislike':''}" onclick="__setLiked('dislike')">👎 Não gostei</button>
-        </div>
-        <label style="margin-top:0">Sua nota</label>
+        <label style="margin-top:0">Sua nota (1–10)</label>
         <input type="range" min="1" max="10" step="1" class="score-slider" id="score-slider" value="${myVote.score ?? 5}" oninput="__previewScore(this.value)">
         <div class="score-value" id="score-display">${myVote.score ?? 5}</div>
         <button class="btn btn-gold btn-block" style="margin-top:12px" onclick="__saveVote()">Salvar voto</button>
@@ -2309,9 +2338,9 @@ function renderMovieModal(id){
         <h4 style="color:var(--gold);font-size:16px;margin-bottom:6px">Votos da família</h4>
         ${state.family.members.map(name=>{
           const v = m.votes[name];
-          const has = v && (v.score!=null || v.liked!=null);
+          const has = v && v.score!=null;
           const icon = !has ? '<span class="vote-empty">sem voto ainda</span>' :
-            `${likedIcon(v.liked)} ${v.score!=null?'<b style="color:var(--gold)">'+v.score+'/10</b>':''}`;
+            `<b style="color:var(--gold)">${v.score}/10</b>`;
           return `<div class="vote-line"><span>${name}</span><span>${icon}</span></div>`;
         }).join('')}
         <div class="vote-line"><span>Média da família</span><span><b style="color:var(--gold)">${familyAvg(m) ?? '—'}</b></span></div>
@@ -2326,23 +2355,9 @@ function renderMovieModal(id){
   </div>`);
   document.getElementById('movie-overlay').addEventListener('click',(e)=>{ if(e.target.id==='movie-overlay') __closeMovie(); });
 
-  let manualOverride = false;
-  let pendingLiked = normalizeLiked(myVote.liked) || classifyByScore(myVote.score ?? 5);
-  window.__setLiked = (val)=>{
-    manualOverride = true;
-    pendingLiked = (pendingLiked===val) ? null : val;
-    document.getElementById('btn-like').className = pendingLiked==='like'?'on-like':'';
-    document.getElementById('btn-neutral').className = pendingLiked==='neutral'?'on-neutral':'';
-    document.getElementById('btn-dislike').className = pendingLiked==='dislike'?'on-dislike':'';
-  };
   window.__previewScore = (v)=>{
-    document.getElementById('score-display').textContent = v;
-    if(!manualOverride){
-      pendingLiked = classifyByScore(parseInt(v));
-      document.getElementById('btn-like').className = pendingLiked==='like'?'on-like':'';
-      document.getElementById('btn-neutral').className = pendingLiked==='neutral'?'on-neutral':'';
-      document.getElementById('btn-dislike').className = pendingLiked==='dislike'?'on-dislike':'';
-    }
+    const el = document.getElementById('score-display');
+    if(el) el.textContent = v;
   };
   window.__toggleListFromMovie = async (listKey, movieId)=>{
     await toggleListItem(listKey, movieId);
@@ -2552,7 +2567,7 @@ function renderMovieModal(id){
   window.__saveVote = ()=>{
     const scoreInput = document.getElementById('score-slider').value;
     const score = parseInt(scoreInput);
-    m.votes[state.me] = { liked: pendingLiked, score: score };
+    m.votes[state.me] = { liked: null, score: score };
     if (!isNaN(score) && score > 0) {
       if (!m.checkins) m.checkins = {};
       if (!m.checkins[state.me]) {
@@ -2659,6 +2674,8 @@ function renderSettingsModal(){
       <p class="hint">Remove do Firebase. Não apaga se alguém tiver nota, check-in, abandono ou estiver em Prioridades/Assistindo/Anotados.</p>
       <button class="btn btn-ghost btn-block" style="margin-top:10px;border-color:var(--gold-dim)" onclick="__cleanupTrainingLowScores()">🧠 Mover minhas notas &lt; 7 para “só algoritmo”</button>
       <p class="hint">Some do catálogo os títulos em que <b>você</b> deu nota 1–6. A nota continua alimentando o algoritmo. Não apaga nada.</p>
+      <button class="btn btn-danger btn-block" style="margin-top:10px" onclick="__cleanupDeleteTrainingOnly()">🗑 Apagar de vez todos os “só algoritmo”</button>
+      <p class="hint">Remove do Firebase os ~593 (ou quantos houver) marcados como só algoritmo, com as notas. O algoritmo deixa de usá-los. Não tem volta.</p>
       <div id="cleanup-msg"></div>
 
       <p class="hint" style="margin-top:10px">Atualiza notas (RT/Metacritic), país/idioma e — com TMDB — estreias, streaming e temporadas. ⏳ Catálogo grande pode demorar; deixe a tela aberta.</p>
@@ -2791,6 +2808,38 @@ function renderSettingsModal(){
     }catch(e){
       msg.innerHTML = `<div class="msg-error">Erro: ${escapeHtml(e.message||String(e))}</div>`;
     }
+  };
+
+  window.__cleanupDeleteTrainingOnly = async ()=>{
+    const targets = state.movies.filter(m => !!m.trainingOnly);
+    if(!targets.length){
+      document.getElementById('cleanup-msg').innerHTML = `<div class="msg-ok">Não há títulos em “só algoritmo”.</div>`;
+      return;
+    }
+    if(!confirm(`APAGAR DE VEZ ${targets.length} título(s) que estão em “só algoritmo”?\n\nAs notas deles saem do Firebase e o algoritmo deixa de usá-los.\n\nIsso não tem volta.`)) return;
+    if(!confirm(`Confirma de novo: excluir permanentemente ${targets.length} títulos (só algoritmo)?`)) return;
+    const msg = document.getElementById('cleanup-msg');
+    msg.innerHTML = `<div class="hint">Apagando ${targets.length}… isso pode levar um minuto.</div>`;
+    const ids = new Set(targets.map(m=>m.id));
+    let ok = 0, fail = 0;
+    for(const m of targets){
+      try{
+        await fbDeleteMovie(m.id);
+        ok++;
+      }catch(e){
+        fail++;
+        console.error('cleanup delete trainingOnly', m.id, e);
+      }
+      if((ok+fail) % 25 === 0){
+        msg.innerHTML = `<div class="hint">Apagando só algoritmo… ${ok+fail}/${targets.length}</div>`;
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }
+    state.movies = state.movies.filter(m => !ids.has(m.id));
+    try{ saveMoviesCache(state.movies); }catch(e){}
+    try{ initRecWorkerData(); }catch(e){}
+    msg.innerHTML = `<div class="msg-ok">Removidos (só algoritmo): ${ok}${fail?` · falhas: ${fail}`:''}. Restam no Firebase: ${state.movies.length}.</div>`;
+    refreshCleanupStats();
   };
 
   window.__cleanupDeleteOrphans = async ()=>{
