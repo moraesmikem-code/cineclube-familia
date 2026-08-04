@@ -1287,17 +1287,22 @@ function computeAllViaWorker(person, onProgress){
     // Garante INIT antes do compute
     if(!_recWorkerReady){
       initRecWorkerData();
+      let sent = false;
+      const sendCompute = ()=>{
+        if(sent) return;
+        sent = true;
+        clearTimeout(safetyTimer);
+        try{ w.postMessage({ type: 'COMPUTE_ALL', person }); }catch(e){}
+      };
       const waitReady = (e2)=>{
         if(e2.data && e2.data.type === 'READY'){
           w.removeEventListener('message', waitReady);
-          w.postMessage({ type: 'COMPUTE_ALL', person });
+          sendCompute();
         }
       };
       w.addEventListener('message', waitReady);
-      // timeout de segurança
-      setTimeout(()=>{
-        try{ w.postMessage({ type: 'COMPUTE_ALL', person }); }catch(e){}
-      }, 800);
+      // timeout de segurança — só dispara se o READY nunca chegar
+      const safetyTimer = setTimeout(sendCompute, 800);
     } else {
       w.postMessage({ type: 'COMPUTE_ALL', person });
     }
