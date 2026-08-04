@@ -434,6 +434,7 @@ const IDB_NAME = 'cineclube-db';
 const IDB_STORE = 'kv';
 
 function slimMovie(m){
+  // Mantém sinopse/elenco/roteiro no cache — senão o modal fica vazio na abertura offline
   return {
     id:m.id, imdbId:m.imdbId, type:m.type, titlePt:m.titlePt, titleOriginal:m.titleOriginal,
     titleEn:m.titleEn, year:m.year, poster:m.poster, posterCustom:m.posterCustom,
@@ -441,8 +442,19 @@ function slimMovie(m){
     runtimeMin:m.runtimeMin, releaseDate:m.releaseDate, countries:m.countries,
     languages:m.languages, primaryLanguage:m.primaryLanguage, production:m.production,
     ratings:m.ratings, votes:m.votes, checkins:m.checkins, addedAt:m.addedAt, updatedAt:m.updatedAt,
-    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, keywords:m.keywords, hiddenBy:m.hiddenBy
+    dismissedBy:m.dismissedBy, abandonedBy:m.abandonedBy, keywords:m.keywords, hiddenBy:m.hiddenBy,
+    synopsisPt:m.synopsisPt, plot:m.plot, synopsisAuto:m.synopsisAuto,
+    tmdbId:m.tmdbId, releaseStatus:m.releaseStatus, nextEpisode:m.nextEpisode,
+    seasons:m.seasons, theatricalBR:m.theatricalBR, streaming:m.streaming
   };
+}
+function topActors(m, n=5){
+  if(!m || !m.actors) return '';
+  return String(m.actors).split(',').map(s=>s.trim()).filter(Boolean).slice(0, n).join(', ');
+}
+function topWriters(m, n=5){
+  if(!m || !m.writer) return '';
+  return String(m.writer).split(',').map(s=>s.trim()).filter(Boolean).slice(0, n).join(', ');
 }
 
 // Marca de tempo (ms) do último sync bem-sucedido com o Firestore. É a partir dela que a
@@ -1294,7 +1306,10 @@ function catalogListHtml(list){
   const visible = list.slice(0, pageSize);
   let html = visible.map(renderCard).join('');
   if(list.length > pageSize){
-    html += `<button class="btn btn-ghost btn-block" style="margin:10px 0" onclick="__loadMoreCatalog()">Carregar mais (${list.length - pageSize} restantes)</button>`;
+    // Sentinela de scroll infinito (IntersectionObserver) — estilo IMDb
+    html += `<div id="catalog-sentinel" data-remaining="${list.length - pageSize}" style="height:48px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px">
+      <span class="loading-spin" style="width:18px;height:18px;margin:0 8px 0 0;border-width:2px"></span> carregando mais…
+    </div>`;
   }
   return html;
 }
@@ -1307,12 +1322,14 @@ function fillVisibleRecPcts(){
     const end = Math.min(i + 8, arr.length);
     for(; i < end; i++){
       const el = arr[i];
+      if(el.getAttribute('data-rec-filled')) continue;
       const id = el.getAttribute('data-rec-id');
       const movie = state.movies.find(x => x.id === id);
       if(!movie){ el.textContent = ''; continue; }
       try{
         const pct = getAffinityPct(movie, state.me);
         el.innerHTML = pct >= 0 ? `Recomendação: <b style="color:var(--gold)">${pct}%</b>` : '';
+        el.setAttribute('data-rec-filled','1');
       }catch(e){ el.textContent = ''; }
     }
     if(i < arr.length){
@@ -1322,12 +1339,49 @@ function fillVisibleRecPcts(){
   };
   step();
 }
+let _catalogObserver = null;
+function bindCatalogInfiniteScroll(){
+  if(_catalogObserver){ try{ _catalogObserver.disconnect(); }catch(e){} _catalogObserver = null; }
+  const sentinel = document.getElementById('catalog-sentinel');
+  if(!sentinel) return;
+  _catalogObserver = new IntersectionObserver((entries)=>{
+    const hit = entries.some(e => e.isIntersecting);
+    if(!hit) return;
+    // Evita disparos em cascata
+    if(state._loadingMoreCatalog) return;
+    state._loadingMoreCatalog = true;
+    state.catalogPageSize = (state.catalogPageSize||24) + 24;
+    const el = document.getElementById('catalog');
+    if(el){
+      // Append só dos novos cards (não reconstrói os já na tela)
+      const list = getFilteredSorted();
+      const prev = state.catalogPageSize - 24;
+      const nextChunk = list.slice(prev, state.catalogPageSize);
+      const frag = document.createDocumentFragment();
+      const tmp = document.createElement('div');
+      tmp.innerHTML = nextChunk.map(renderCard).join('');
+      while(tmp.firstChild) frag.appendChild(tmp.firstChild);
+      sentinel.remove();
+      el.appendChild(frag);
+      if(list.length > state.catalogPageSize){
+        el.insertAdjacentHTML('beforeend', `<div id="catalog-sentinel" data-remaining="${list.length - state.catalogPageSize}" style="height:48px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px">
+          <span class="loading-spin" style="width:18px;height:18px;margin:0 8px 0 0;border-width:2px"></span> carregando mais…
+        </div>`);
+        bindCatalogInfiniteScroll();
+      }
+      fillVisibleRecPcts();
+    }
+    state._loadingMoreCatalog = false;
+  }, { root: null, rootMargin: '200px', threshold: 0 });
+  _catalogObserver.observe(sentinel);
+}
 window.__loadMoreCatalog = ()=>{
   state.catalogPageSize = (state.catalogPageSize||24) + 24;
   const el = document.getElementById('catalog');
   if(el){
     el.innerHTML = catalogListHtml(getFilteredSorted());
     fillVisibleRecPcts();
+    bindCatalogInfiniteScroll();
   }
 };
 
@@ -1522,8 +1576,9 @@ function refreshFiltersAndCatalog(){
   const el = document.getElementById('filters-and-catalog');
   if(el){
     el.innerHTML = filtersAndCatalogHtml();
-    if(typeof requestIdleCallback === 'function') requestIdleCallback(()=>fillVisibleRecPcts(), { timeout: 400 });
-    else setTimeout(fillVisibleRecPcts, 0);
+    const afterPaint = ()=>{ fillVisibleRecPcts(); bindCatalogInfiniteScroll(); };
+    if(typeof requestIdleCallback === 'function') requestIdleCallback(afterPaint, { timeout: 400 });
+    else setTimeout(afterPaint, 0);
   } else {
     render();
   }
@@ -1562,9 +1617,10 @@ function renderMain(){
   </div>
   <button class="fab" onclick="__openAdd()">+</button>
   `;
-  // % de recomendação em idle (não trava a 1ª pintura)
-  if(typeof requestIdleCallback === 'function') requestIdleCallback(()=>fillVisibleRecPcts(), { timeout: 400 });
-  else setTimeout(fillVisibleRecPcts, 0);
+  // % de recomendação em idle + scroll infinito
+  const afterPaint = ()=>{ fillVisibleRecPcts(); bindCatalogInfiniteScroll(); };
+  if(typeof requestIdleCallback === 'function') requestIdleCallback(afterPaint, { timeout: 400 });
+  else setTimeout(afterPaint, 0);
 
   let _searchTimer = null;
   window.__setSearch = (v)=>{
@@ -1577,6 +1633,7 @@ function renderMain(){
         state.catalogPageSize = 24;
         el.innerHTML = catalogListHtml(getFilteredSorted());
         fillVisibleRecPcts();
+        bindCatalogInfiniteScroll();
       }
     }, 180);
   };
@@ -1612,6 +1669,7 @@ function renderMain(){
     if(el){
       el.innerHTML = catalogListHtml(getFilteredSorted());
       fillVisibleRecPcts();
+      bindCatalogInfiniteScroll();
     }
   }
   window.__setDir = (v)=>{ state.sortDir=v; refreshCatalogOnly(); };
@@ -1904,7 +1962,6 @@ function renderAddModal(){
 function mergeFreshOmdbInto(movie, fresh){
   if(!movie.ratings) movie.ratings = {};
   if(!fresh.ratings) fresh.ratings = {};
-  // Atualiza sempre que a OMDb trouxer valor (não só quando o campo antigo era null)
   if(fresh.ratings.imdb != null) movie.ratings.imdb = fresh.ratings.imdb;
   if(fresh.ratings.imdbVotes != null) movie.ratings.imdbVotes = fresh.ratings.imdbVotes;
   if(fresh.ratings.rtCritics != null) movie.ratings.rtCritics = fresh.ratings.rtCritics;
@@ -1916,12 +1973,54 @@ function mergeFreshOmdbInto(movie, fresh){
   if(fresh.actors) movie.actors = fresh.actors;
   if(fresh.writer) movie.writer = fresh.writer;
   if(fresh.runtimeMin) movie.runtimeMin = fresh.runtimeMin;
+  if(fresh.plotEn){
+    if(!movie.plot) movie.plot = fresh.plotEn;
+    if(!movie.synopsisPt && !movie.plot) movie.plot = fresh.plotEn;
+  }
+}
+
+async function softFillMovieDetails(movie){
+  if(!movie || !movie.imdbId || !state.apiKey) return false;
+  const needs = !displaySynopsis(movie) || !movie.actors || !movie.writer || !movie.director;
+  if(!needs) return false;
+  try{
+    const fresh = await fetchOmdb(movie.imdbId);
+    mergeFreshOmdbInto(movie, fresh);
+    if(fresh.plotEn && !displaySynopsis(movie)) movie.plot = fresh.plotEn;
+    await fbSaveMovie(movie);
+    if(state.modalMovie === movie.id){
+      const syn = document.querySelector('#movie-overlay .synopsis');
+      if(syn) syn.innerHTML = escapeHtml(displaySynopsis(movie)) || '<span style="color:var(--muted)">Sinopse não disponível.</span>';
+      const credits = document.querySelector('#movie-overlay .credits');
+      if(credits){
+        const genreLine = (movie.genres||[]).join(', ') || '—';
+        const dur = movie.runtimeMin ? movie.runtimeMin+' min' : '—';
+        const lanc = movie.releaseDate ? new Date(movie.releaseDate).toLocaleDateString('pt-BR') : '—';
+        const kw = movie.keywords && movie.keywords.length
+          ? `<p><b>Keywords:</b> ${escapeHtml(movie.keywords.slice(0,12).join(', '))}${movie.keywords.length>12?'…':''}</p>`
+          : `<p class="hint" style="margin:4px 0 0">Keywords: ainda não carregadas — toque em “Verificar novidades”.</p>`;
+        credits.innerHTML = `
+          <p><b>Diretor:</b> ${escapeHtml(movie.director)||'—'}</p>
+          <p><b>Roteirista:</b> ${escapeHtml(topWriters(movie))||'—'}</p>
+          <p><b>Elenco:</b> ${escapeHtml(topActors(movie, 5))||'—'}</p>
+          <p><b>Gêneros:</b> ${escapeHtml(genreLine)}</p>
+          <p><b>Duração:</b> ${dur}</p>
+          <p><b>Lançamento:</b> ${lanc}</p>
+          ${kw}`;
+      }
+    }
+    return true;
+  }catch(e){
+    console.error('softFillMovieDetails', e);
+    return false;
+  }
 }
 
 function renderMovieModal(id){
   const m = state.movies.find(x=>x.id===id);
   if(!m){ state.modalMovie=null; return; }
   const myVote = m.votes[state.me] || {liked:null, score:null};
+  if(!displaySynopsis(m) || !m.actors || !m.writer) softFillMovieDetails(m);
   document.body.insertAdjacentHTML('beforeend', `
   <div class="overlay" id="movie-overlay">
     <div class="modal">
@@ -1932,12 +2031,12 @@ function renderMovieModal(id){
       </div>
       ${altTitlesLine(m) ? `<p style="font-size:12.5px;color:var(--muted);margin:-6px 0 10px">${escapeHtml(altTitlesLine(m))}</p>` : ''}
       ${posterUrl(m)?`<img class="modal-poster" src="${escapeAttr(posterUrl(m))}" onerror="this.style.display='none'">`:`<div class="poster-ph" style="margin:12px auto;width:140px;height:200px;display:flex;align-items:center;justify-content:center;background:var(--card);border-radius:10px">🎬</div>`}
-      <p class="synopsis">${escapeHtml(displaySynopsis(m)) || '<span style="color:var(--muted)">Sinopse não disponível.</span>'}</p>
+      <p class="synopsis">${escapeHtml(displaySynopsis(m)) || '<span style="color:var(--muted)">Sinopse não disponível. Toque em “Atualizar (OMDb)” se precisar.</span>'}</p>
       ${m.synopsisAuto ? `<div class="hint">🌐 Sinopse traduzida automaticamente.</div>` : ''}
       <div class="credits">
         <p><b>Diretor:</b> ${escapeHtml(m.director)||'—'}</p>
-        <p><b>Roteirista:</b> ${escapeHtml(m.writer)||'—'}</p>
-        <p><b>Elenco:</b> ${escapeHtml(m.actors)||'—'}</p>
+        <p><b>Roteirista:</b> ${escapeHtml(topWriters(m))||'—'}</p>
+        <p><b>Elenco:</b> ${escapeHtml(topActors(m, 5))||'—'}</p>
         <p><b>Gêneros:</b> ${(m.genres||[]).join(', ')||'—'}</p>
         <p><b>Duração:</b> ${m.runtimeMin?m.runtimeMin+' min':'—'}</p>
         <p><b>Lançamento:</b> ${m.releaseDate?new Date(m.releaseDate).toLocaleDateString('pt-BR'):'—'}</p>
@@ -4081,6 +4180,13 @@ function renderErrorLogModal(){
     state.addFlow = { step:'input', url:`https://www.imdb.com/title/${imdbId}/`, error:null, loading:false, data:null };
     render();
   };
+}
+
+// Service Worker: cache de assets estáticos (2ª abertura mais rápida)
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('./sw.js').catch(e=>console.log('SW não registrado', e));
+  });
 }
 
 init();
