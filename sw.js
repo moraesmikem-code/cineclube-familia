@@ -1,5 +1,5 @@
 /* Cineclube — Service Worker (cache de assets estáticos) */
-const CACHE = 'cineclube-static-v1';
+const CACHE = 'cineclube-static-v2';
 const PRECACHE = [
   './',
   './index.html',
@@ -9,7 +9,12 @@ const PRECACHE = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(PRECACHE).catch(() => {}))
+    caches.open(CACHE).then((cache) =>
+      // Guarda cada arquivo individualmente: se um faltar (ex.: manifest.json ainda
+      // não publicado), os outros continuam sendo cacheados normalmente. Com
+      // cache.addAll, um único 404 cancelava o cache de tudo, silenciosamente.
+      Promise.all(PRECACHE.map((url) => cache.add(url).catch(() => {})))
+    )
   );
   self.skipWaiting();
 });
@@ -64,4 +69,4 @@ self.addEventListener('fetch', (event) => {
       });
     })
   );
-};
+});
