@@ -805,16 +805,50 @@ function estimateAffinity(movie, person){
 
 
 function slimForWorker(m){
-  // só campos usados no algoritmo
+  // Campos mínimos (já vêm enxutos do main; reforça se INIT mandar objeto cheio)
+  if(!m) return m;
+  const r = m.ratings || {};
+  const votes = {};
+  if(m.votes){
+    Object.keys(m.votes).forEach(name=>{
+      const v = m.votes[name];
+      if(v && v.score!=null) votes[name] = { score: v.score };
+    });
+  }
+  const checkins = {};
+  if(m.checkins){
+    Object.keys(m.checkins).forEach(name=>{
+      if(m.checkins[name]) checkins[name] = m.checkins[name];
+    });
+  }
+  const abandonedBy = {};
+  if(m.abandonedBy){
+    Object.keys(m.abandonedBy).forEach(name=>{
+      if(m.abandonedBy[name]) abandonedBy[name] = m.abandonedBy[name];
+    });
+  }
   return {
-    id: m.id, imdbId: m.imdbId, type: m.type,
+    id: m.id,
+    imdbId: m.imdbId,
     titlePt: m.titlePt, titleOriginal: m.titleOriginal, titleEn: m.titleEn, title: m.title,
-    year: m.year, director: m.director, writer: m.writer, actors: m.actors,
-    genres: m.genres, countries: m.countries, production: m.production,
-    runtimeMin: m.runtimeMin, keywords: m.keywords,
-    ratings: m.ratings, votes: m.votes, checkins: m.checkins,
-    dismissedBy: m.dismissedBy, abandonedBy: m.abandonedBy,
-    synopsisPt: m.synopsisPt, plot: m.plot, seasons: m.seasons, episodeVotes: m.episodeVotes
+    year: m.year,
+    director: m.director, writer: m.writer, actors: m.actors,
+    genres: m.genres || [],
+    countries: m.countries || [],
+    production: m.production || '',
+    keywords: m.keywords || [],
+    ratings: {
+      imdb: r.imdb != null ? r.imdb : null,
+      imdbVotes: r.imdbVotes != null ? r.imdbVotes : null,
+      rtCritics: r.rtCritics != null ? r.rtCritics : null,
+      metacritic: r.metacritic != null ? r.metacritic : null
+    },
+    votes,
+    checkins,
+    dismissedBy: m.dismissedBy || [],
+    abandonedBy,
+    synopsisPt: m.synopsisPt ? String(m.synopsisPt).slice(0, 400) : '',
+    plot: m.plot ? String(m.plot).slice(0, 400) : ''
   };
 }
 
@@ -850,11 +884,22 @@ self.onmessage = function(e){
       const results = {};
       const total = movies.length;
       const REPORT_EVERY = 200;
+      function isSeen(m){
+        const v = m.votes && m.votes[person];
+        if(v && v.score != null) return true;
+        if(m.checkins && m.checkins[person]) return true;
+        if(m.abandonedBy && m.abandonedBy[person]) return true;
+        return false;
+      }
       for(let i = 0; i < total; i++){
         const m = movies[i];
         try {
-          const rec = estimateAffinity(m, person);
-          results[m.id] = (rec && rec.ready && rec.pct != null) ? rec.pct : -1;
+          if(isSeen(m)){
+            results[m.id] = -1;
+          } else {
+            const rec = estimateAffinity(m, person);
+            results[m.id] = (rec && rec.ready && rec.pct != null) ? rec.pct : -1;
+          }
         } catch(err){
           results[m.id] = -1;
         }
