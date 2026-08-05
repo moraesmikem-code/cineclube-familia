@@ -118,11 +118,6 @@ function buildTasteProfileRaw(person, excludeId){
     if(v && v.score!=null){
       count++;
       applyMovie(m, (v.score - 5.5) * franchiseMul);
-    } else if(m.abandonedBy && m.abandonedBy[person]){
-      const pct = m.abandonedBy[person].pctWatched;
-      const eq = abandonToScore(pct);
-      count++;
-      applyMovie(m, (eq - 5.5) * 0.7 * franchiseMul);
     } else if(m.dismissedBy && m.dismissedBy.includes(person)){
       applyMovie(m, -2.5 * franchiseMul);
     }
@@ -223,23 +218,6 @@ function shrunkWeight(entry, feature){
   return avg * confidence;
 }
 
-// Abandono → nota equivalente (proxy). Quanto mais cedo parou, mais negativo.
-// 15% ≈ 2,3 · 60% ≈ 4,5 · 90% ≈ 6,0
-function abandonToScore(pctWatched){
-  const p = Math.max(0, Math.min(100, pctWatched == null ? 25 : Number(pctWatched))) / 100;
-  return 1.5 + p * 5;
-}
-// Progresso de série a partir de episódios marcados
-function seriesProgressPct(movie, person){
-  const seasons = movie.seasons || [];
-  let total = 0;
-  seasons.forEach(s=>{ total += (s.episodeCount || 0); });
-  if(total <= 0) return null;
-  const votes = (movie.episodeVotes && movie.episodeVotes[person]) || {};
-  let watched = 0;
-  Object.keys(votes).forEach(k=>{ if(votes[k] && votes[k].watched) watched++; });
-  return Math.round(100 * watched / total);
-}
 
 // Sinal "cru" — padrões de gosto (pessoas, país, década, combinações de gênero…).
 function rawTasteSignal(movie, maps){

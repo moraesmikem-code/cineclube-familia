@@ -403,21 +403,6 @@ async function toggleListItem(listKey, movieId){
   if(idx>=0) arr.splice(idx,1); else arr.push({ id: uid(), movieId, addedAt: new Date().toISOString() });
   await saveListData(listKey);
 }
-function normalizeLiked(v){
-  if(v===true) return 'like';
-  if(v===false) return 'dislike';
-  if(v==='like'||v==='neutral'||v==='dislike') return v;
-  return null;
-}
-function likedIcon(v){
-  const n = normalizeLiked(v);
-  return n==='like' ? '👍' : n==='neutral' ? '😐' : n==='dislike' ? '👎' : '';
-}
-function classifyByScore(score){
-  if(score<=4) return 'dislike';
-  if(score<=6) return 'neutral';
-  return 'like';
-}
 
 /* ---------- INIT ---------- */
 const LIST_TYPES = {
@@ -577,6 +562,12 @@ function applyConfigs(results){
   }
   state.apiKey = key || null;
   state.tmdbKey = tmdbKey || null;
+  // Cache local — evita a tela de Configurações abrir em branco enquanto o Firestore
+  // ainda não respondeu (a causa das chaves "sumindo" ao reabrir o app).
+  try{
+    if(state.apiKey) localStorage.setItem('cineclube-omdb-key-cache', state.apiKey);
+    if(state.tmdbKey) localStorage.setItem('cineclube-tmdb-key-cache', state.tmdbKey);
+  }catch(e){}
   state.lastGeneralUpdateAt = lastGeneralUpdate || null;
   try{ state.updateErrorLog = updateErrorLogRaw ? JSON.parse(updateErrorLogRaw) : []; }catch(e){ state.updateErrorLog = []; }
   try{ state.importErrorLog = importErrorLogRaw ? JSON.parse(importErrorLogRaw) : []; }catch(e){ state.importErrorLog = []; }
@@ -647,6 +638,9 @@ function refreshMoviesBackground(){
 async function init(){
   // Identidade local imediata
   try{ state.me = localStorage.getItem('my-identity') || null; }catch(e){ state.me = null; }
+  // Chaves de API: cache local imediato (Firestore confirma/atualiza depois, em background)
+  try{ state.apiKey = localStorage.getItem('cineclube-omdb-key-cache') || null; }catch(e){ state.apiKey = null; }
+  try{ state.tmdbKey = localStorage.getItem('cineclube-tmdb-key-cache') || null; }catch(e){ state.tmdbKey = null; }
   state.catalogPageSize = 24;
 
   // Família: cache local → senão inferir dos filmes → senão placeholder temporário
@@ -831,15 +825,28 @@ async function fetchTmdbLang(imdbId, lang, mediaType){
   if(mediaType === 'series'){
     if(data.tv_results && data.tv_results.length){
       const r = data.tv_results[0];
-      return { title: r.name, original_title: r.original_name, overview: r.overview };
+      return { id: r.id, title: r.name, original_title: r.original_name, overview: r.overview };
     }
     return null;
   }
   if(data.movie_results && data.movie_results.length){
     const r = data.movie_results[0];
-    return { title: r.title, original_title: r.original_title, overview: r.overview };
+    return { id: r.id, title: r.title, original_title: r.original_title, overview: r.overview };
   }
   return null;
+}
+// Top 5 atores por ordem de bilheteria (TMDB) — a OMDb só traz 3 no plano usado aqui.
+async function fetchTmdbCredits(tmdbId, mediaType){
+  try{
+    const path = mediaType === 'series' ? 'tv' : 'movie';
+    const url = `https://api.themoviedb.org/3/${path}/${tmdbId}/credits?api_key=${encodeURIComponent(state.tmdbKey)}`;
+    const res = await fetchWithTimeout(url);
+    const data = await res.json();
+    const cast = (data.cast || []).slice().sort((a,b)=>(a.order??999)-(b.order??999));
+    return cast.slice(0,5).map(c=>c.name).filter(Boolean);
+  }catch(e){
+    return [];
+  }
 }
 
 async function fetchTmdbId(imdbId, mediaType){
@@ -889,13 +896,15 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
     const providers = (data['watch/providers'] && data['watch/providers'].results && data['watch/providers'].results.BR) || {};
     const streaming = (providers.flatrate||[]).map(p=>({name:p.provider_name, logo:p.logo_path}));
     const keywords = await fetchTmdbKeywords(tmdbId, 'series');
+    const castNames = await fetchTmdbCredits(tmdbId, 'series');
     return {
       tmdbId,
       status: data.status || null,
       nextEpisode: data.next_episode_to_air ? { season:data.next_episode_to_air.season_number, episode:data.next_episode_to_air.episode_number, airDate:data.next_episode_to_air.air_date } : null,
       seasons: (data.seasons||[]).filter(s=>s.season_number>0).map(s=>({ number:s.season_number, episodeCount:s.episode_count, airDate:s.air_date, name:s.name })),
       streaming,
-      keywords
+      keywords,
+      castNames
     };
   }
   const url = `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${encodeURIComponent(state.tmdbKey)}&language=pt-BR&append_to_response=release_dates,watch/providers`;
@@ -910,7 +919,8 @@ async function fetchTmdbDetails(imdbId, mediaType, fallbackTitle, fallbackYear){
     if(theatrical && theatrical.release_date) theatricalBR = theatrical.release_date;
   }
   const keywords = await fetchTmdbKeywords(tmdbId, 'movie');
-  return { tmdbId, status: data.status || null, theatricalBR, streaming, keywords };
+  const castNames = await fetchTmdbCredits(tmdbId, 'movie');
+  return { tmdbId, status: data.status || null, theatricalBR, streaming, keywords, castNames };
 }
 
 async function fetchTmdbSeasonEpisodes(tmdbId, seasonNumber){
@@ -935,7 +945,7 @@ async function translateToPt(text){
 
 async function fetchAllSources(imdbId){
   const omdb = await fetchOmdb(imdbId);
-  let titleOriginal = omdb.titleEn, titlePt = '', synopsisPt = '', synopsisAuto = false;
+  let titleOriginal = omdb.titleEn, titlePt = '', synopsisPt = '', synopsisAuto = false, actors = omdb.actors;
   if(state.tmdbKey){
     try{
       const [pt, en] = await Promise.all([
@@ -947,6 +957,11 @@ async function fetchAllSources(imdbId){
         titlePt = (pt && pt.title) || '';
         synopsisPt = (pt && pt.overview) || '';
         if(en && en.title && !omdb.titleEn) omdb.titleEn = en.title;
+      }
+      const tmdbId = (en && en.id) || (pt && pt.id) || null;
+      if(tmdbId){
+        const cast = await fetchTmdbCredits(tmdbId, omdb.type);
+        if(cast.length) actors = cast.join(', ');
       }
     }catch(e){ /* segue sem TMDB se falhar */ }
   }
@@ -967,7 +982,7 @@ async function fetchAllSources(imdbId){
     poster: omdb.poster,
     synopsisPt: synopsisPt || '',
     synopsisAuto,
-    director: omdb.director, writer: omdb.writer, actors: omdb.actors,
+    director: omdb.director, writer: omdb.writer, actors,
     genres: omdb.genres, runtimeMin: omdb.runtimeMin, releaseDate: omdb.releaseDate,
     countries: omdb.countries, languages: omdb.languages, primaryLanguage: omdb.primaryLanguage, production: omdb.production,
     ratings: omdb.ratings
@@ -1330,14 +1345,19 @@ function computeAllViaWorker(person, onProgress){
       const waitReady = (e2)=>{
         if(e2.data && e2.data.type === 'READY'){
           w.removeEventListener('message', waitReady);
-          w.postMessage({ type: 'COMPUTE_ALL', person });
+          sendCompute();
         }
       };
       w.addEventListener('message', waitReady);
-      // timeout de segurança
-      setTimeout(()=>{
+      let sent = false;
+      const sendCompute = ()=>{
+        if(sent) return;
+        sent = true;
+        clearTimeout(safetyTimer);
         try{ w.postMessage({ type: 'COMPUTE_ALL', person }); }catch(e){}
-      }, 800);
+      };
+      // timeout de segurança — só dispara se o READY nunca chegar
+      const safetyTimer = setTimeout(sendCompute, 800);
     } else {
       w.postMessage({ type: 'COMPUTE_ALL', person });
     }
@@ -2050,25 +2070,14 @@ function renderAddModal(){
     `;
   } else if(af.step === 'duplicate'){
     const existing = af.existingMovie;
-    if(existing.trainingOnly){
-      inner = `
-        <img class="modal-poster" src="${existing.poster || ''}" onerror="this.style.display='none'">
-        <h3 style="margin:0 0 10px">${escapeHtml(displayTitle(existing))}</h3>
-        <div class="msg-ok">Este título está em <b>só algoritmo</b> (nota salva, fora da lista).</div>
-        <p style="font-size:13.5px;color:var(--muted);margin-top:10px">Cole o link de novo para devolvê-lo ao catálogo — a nota e o histórico continuam iguais.</p>
-        <button class="btn btn-gold btn-block" style="margin-top:16px" onclick="__restoreTrainingToCatalog('${existing.id}')">📚 Devolver ao catálogo</button>
-        <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeAdd()">Cancelar</button>
-      `;
-    } else {
-      inner = `
-        <img class="modal-poster" src="${existing.poster || ''}" onerror="this.style.display='none'">
-        <h3 style="margin:0 0 10px">${escapeHtml(displayTitle(existing))}</h3>
-        <div class="msg-error">Esse título já está no catálogo — foi adicionado antes.</div>
-        <p style="font-size:13.5px;color:var(--muted);margin-top:10px">Se você já assistiu, é só abrir o filme e registrar seu voto e check-in — não precisa adicionar de novo.</p>
-        <button class="btn btn-gold btn-block" style="margin-top:16px" onclick="__closeAdd(); __openMovie('${existing.id}')">Abrir e avaliar</button>
-        <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeAdd()">Fechar</button>
-      `;
-    }
+    inner = `
+      <img class="modal-poster" src="${existing.poster || ''}" onerror="this.style.display='none'">
+      <h3 style="margin:0 0 10px">${escapeHtml(displayTitle(existing))}</h3>
+      <div class="msg-error">Esse título já está no catálogo — foi adicionado antes.</div>
+      <p style="font-size:13.5px;color:var(--muted);margin-top:10px">Se você já assistiu, é só abrir o filme e registrar seu voto e check-in — não precisa adicionar de novo.</p>
+      <button class="btn btn-gold btn-block" style="margin-top:16px" onclick="__closeAdd(); __openMovie('${existing.id}')">Abrir e avaliar</button>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px" onclick="__closeAdd()">Fechar</button>
+    `;
   } else if(af.step === 'confirm'){
     const d = af.data;
     const displayTitle = d.titlePt || d.titleOriginal;
@@ -2118,23 +2127,25 @@ function renderAddModal(){
   document.getElementById('add-overlay').addEventListener('click', (e)=>{ if(e.target.id==='add-overlay') __closeAdd(); });
 
   window.__closeAdd = ()=>{ state.addFlow=null; render(); };
-  window.__restoreTrainingToCatalog = async (id)=>{
-    const movie = state.movies.find(x=>x.id===id);
-    if(!movie){ state.addFlow=null; render(); return; }
-    movie.trainingOnly = false;
-    try{ notifyWorkerMovieUpdated(movie); }catch(e){}
-    await fbSaveMovie(movie);
-    try{ saveMoviesCache(state.movies); }catch(e){}
-    state.addFlow = null;
-    state.modalMovie = movie.id;
-    render();
-  };
   window.__searchImdb = async ()=>{
     const val = document.getElementById('imdb-url').value.trim();
     const id = extractImdbId(val);
     if(!id){ state.addFlow.error='Não encontrei um ID válido do IMDb nesse link (deve conter algo como tt1234567).'; render(); return; }
     const existing = state.movies.find(m=>m.imdbId===id);
-    if(existing){ state.addFlow.step='duplicate'; state.addFlow.existingMovie=existing; render(); return; }
+    if(existing){
+      if(existing.trainingOnly){
+        // Estava só alimentando o algoritmo (fora da lista) — devolve ao catálogo na hora, sem tratar como duplicado.
+        existing.trainingOnly = false;
+        try{ notifyWorkerMovieUpdated(existing); }catch(e){}
+        fbSaveMovie(existing).catch(e=>console.error('erro ao devolver ao catálogo', e));
+        try{ saveMoviesCache(state.movies); }catch(e){}
+        state.addFlow = null;
+        state.modalMovie = existing.id;
+        render();
+        return;
+      }
+      state.addFlow.step='duplicate'; state.addFlow.existingMovie=existing; render(); return;
+    }
     state.addFlow.loading = true; state.addFlow.error=null; state.addFlow.url=val; render();
     try{
       const data = await fetchAllSources(id);
@@ -2350,7 +2361,7 @@ function renderMovieModal(id){
         ${m.trainingOnly ? '📚 Devolver ao catálogo' : '🧠 Só algoritmo (some da lista, mantém a nota)'}
       </button>
       <p class="hint">${m.trainingOnly ? 'Este título está oculto no catálogo, mas a nota continua alimentando as recomendações.' : 'Some da lista para deixar o app mais rápido. A nota continua no Firebase e no algoritmo.'}</p>
-      <button class="btn btn-danger btn-block" style="margin-top:12px" onclick="__deleteMovie('${m.id}')">Remover filme só da minha lista</button>
+      <button class="btn btn-danger btn-block" style="margin-top:12px" onclick="__deleteMovie('${m.id}')">Remover do catálogo</button>
     </div>
   </div>`);
   document.getElementById('movie-overlay').addEventListener('click',(e)=>{ if(e.target.id==='movie-overlay') __closeMovie(); });
@@ -2382,41 +2393,8 @@ function renderMovieModal(id){
     if(!movie) return;
     if(!movie.checkins) movie.checkins = {};
     movie.checkins[state.me] = movie.checkins[state.me] ? null : new Date().toISOString();
-    // Se marcou assistido completo, remove abandono
-    if(movie.checkins[state.me] && movie.abandonedBy && movie.abandonedBy[state.me]){
-      delete movie.abandonedBy[state.me];
-    }
     render();
     fbSaveMovie(movie).catch(e => console.error("Erro ao salvar check-in:", e));
-  };
-  window.__markAbandon = (id)=>{
-    const movie = state.movies.find(x=>x.id===id);
-    if(!movie) return;
-    let pct = 25;
-    const inp = document.getElementById('abandon-pct');
-    if(inp && inp.value !== ''){
-      const n = parseInt(inp.value);
-      if(!isNaN(n)) pct = Math.max(1, Math.min(99, n));
-    } else if(movie.type==='series'){
-      const sp = seriesProgressPct(movie, state.me);
-      if(sp != null) pct = Math.max(1, Math.min(99, sp));
-    }
-    if(!movie.abandonedBy) movie.abandonedBy = {};
-    movie.abandonedBy[state.me] = { at: new Date().toISOString(), pctWatched: pct };
-    // Abandonar não conta como assistido completo
-    if(movie.checkins && movie.checkins[state.me]) movie.checkins[state.me] = null;
-    // Limpa cache de recomendação
-    _recPctCache = { key: '', map: new Map() };
-    render();
-    fbSaveMovie(movie).catch(e => console.error("Erro ao salvar abandono:", e));
-  };
-  window.__clearAbandon = (id)=>{
-    const movie = state.movies.find(x=>x.id===id);
-    if(!movie || !movie.abandonedBy) return;
-    delete movie.abandonedBy[state.me];
-    _recPctCache = { key: '', map: new Map() };
-    render();
-    fbSaveMovie(movie).catch(e => console.error("Erro ao limpar abandono:", e));
   };
   window.__toggleEditRatings = (id)=>{
     const modal = document.querySelector('#movie-overlay .modal');
@@ -2524,6 +2502,7 @@ function renderMovieModal(id){
       movie.streaming = details.streaming;
       movie.releaseStatus = details.status;
       if(details.keywords) movie.keywords = details.keywords;
+      if(details.castNames && details.castNames.length) movie.actors = details.castNames.join(', ');
       if(movie.type==='series'){
         movie.nextEpisode = details.nextEpisode;
         movie.seasons = details.seasons;
@@ -2604,12 +2583,19 @@ function renderMovieModal(id){
     }
   };
   window.__deleteMovie = async (id)=>{
-    if(!confirm('Remover este filme só da SUA lista? Ele continua no catálogo dos outros, com os votos deles intactos.')) return;
     const movie = state.movies.find(x=>x.id===id);
-    if(movie){
-      if(!movie.hiddenBy) movie.hiddenBy = [];
-      if(!movie.hiddenBy.includes(state.me)) movie.hiddenBy.push(state.me);
-      await fbSaveMovie(movie);
+    if(!movie) return;
+    const titulo = displayTitle(movie);
+    if(!confirm(`Remover "${titulo}" do catálogo pra sempre?\n\nIsso apaga o título — com notas, check-ins e histórico de TODA a família — do Firebase. Não tem volta.`)) return;
+    if(!confirm(`Confirma de novo: excluir "${titulo}" permanentemente?`)) return;
+    try{
+      await fbDeleteMovie(id);
+      state.movies = state.movies.filter(x=>x.id!==id);
+      try{ saveMoviesCache(state.movies); }catch(e){}
+      try{ initRecWorkerData(); }catch(e){}
+    }catch(e){
+      alert('Não consegui remover agora: ' + (e.message||'erro desconhecido'));
+      return;
     }
     state.modalMovie = null;
     render();
@@ -3025,6 +3011,7 @@ function renderSettingsModal(){
                 movie.streaming = details.streaming;
                 movie.releaseStatus = details.status;
                 if(details.keywords) movie.keywords = details.keywords;
+                if(details.castNames && details.castNames.length) movie.actors = details.castNames.join(', ');
                 if(movie.type==='series'){ movie.nextEpisode = details.nextEpisode; movie.seasons = details.seasons; }
                 else { movie.theatricalBR = details.theatricalBR; }
                 movie.lastUpdatedAt = new Date().toISOString();
@@ -3074,12 +3061,14 @@ function renderSettingsModal(){
     const val = document.getElementById('api-key-input').value.trim();
     const res = await sSet('omdb-key', val, true);
     state.apiKey = val;
+    try{ localStorage.setItem('cineclube-omdb-key-cache', val); }catch(e){}
     document.getElementById('key-msg').innerHTML = res.ok ? `<div class="msg-ok">Chave salva!</div>` : `<div class="msg-error">Erro: ${escapeHtml(res.error)}</div>`;
   };
   window.__saveTmdbKey = async ()=>{
     const val = document.getElementById('tmdb-key-input').value.trim();
     const res = await sSet('tmdb-key', val, true);
     state.tmdbKey = val;
+    try{ localStorage.setItem('cineclube-tmdb-key-cache', val); }catch(e){}
     document.getElementById('tmdb-key-msg').innerHTML = res.ok ? `<div class="msg-ok">Chave salva!</div>` : `<div class="msg-error">Erro: ${escapeHtml(res.error)}</div>`;
   };
   window.__saveMembers = async ()=>{
@@ -3290,11 +3279,6 @@ function buildTasteProfileRaw(person, excludeId){
     if(v && v.score!=null){
       count++;
       applyMovie(m, (v.score - 5.5) * franchiseMul);
-    } else if(m.abandonedBy && m.abandonedBy[person]){
-      const pct = m.abandonedBy[person].pctWatched;
-      const eq = abandonToScore(pct);
-      count++;
-      applyMovie(m, (eq - 5.5) * 0.7 * franchiseMul);
     } else if(m.dismissedBy && m.dismissedBy.includes(person)){
       applyMovie(m, -2.5 * franchiseMul);
     }
@@ -3395,23 +3379,6 @@ function shrunkWeight(entry, feature){
   return avg * confidence;
 }
 
-// Abandono → nota equivalente (proxy). Quanto mais cedo parou, mais negativo.
-// 15% ≈ 2,3 · 60% ≈ 4,5 · 90% ≈ 6,0
-function abandonToScore(pctWatched){
-  const p = Math.max(0, Math.min(100, pctWatched == null ? 25 : Number(pctWatched))) / 100;
-  return 1.5 + p * 5;
-}
-// Progresso de série a partir de episódios marcados
-function seriesProgressPct(movie, person){
-  const seasons = movie.seasons || [];
-  let total = 0;
-  seasons.forEach(s=>{ total += (s.episodeCount || 0); });
-  if(total <= 0) return null;
-  const votes = (movie.episodeVotes && movie.episodeVotes[person]) || {};
-  let watched = 0;
-  Object.keys(votes).forEach(k=>{ if(votes[k] && votes[k].watched) watched++; });
-  return Math.round(100 * watched / total);
-}
 
 // Sinal "cru" — padrões de gosto (pessoas, país, década, combinações de gênero…).
 function rawTasteSignal(movie, maps){
@@ -4248,6 +4215,11 @@ window.__toggleImportDest = (key)=>{
 async function __applyExistingRating(entry){
   const movie = state.movies.find(m=>m.imdbId===entry.imdbId);
   if(!movie) return false;
+  if(movie.trainingOnly){
+    // Estava só alimentando o algoritmo (fora da lista) — reimportar devolve ao catálogo.
+    movie.trainingOnly = false;
+    try{ notifyWorkerMovieUpdated(movie); }catch(e){}
+  }
   if(entry.rating!=null){
     if(!movie.votes) movie.votes = {};
     movie.votes[state.me] = { liked: null, score: entry.rating };
