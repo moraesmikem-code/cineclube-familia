@@ -2044,7 +2044,11 @@ function showVoteSavedFeedback(){
 
 function renderCard(m){
   const genres = (m.genres||[]).slice(0,3);
-  const posterHtml = posterUrl(m) ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="" loading="lazy" decoding="async">` : `<div class="poster-ph">🎬</div>`;
+  // Já assistidos: não baixa a imagem na lista (placeholder) — alivia rede e RAM
+  const skipPosterImg = state.me && isSeenBy(m, state.me);
+  const posterHtml = (!skipPosterImg && posterUrl(m))
+    ? `<img class="poster" src="${escapeAttr(posterUrl(m))}" alt="" loading="lazy" decoding="async">`
+    : `<div class="poster-ph">🎬</div>`;
   const votesHtml = state.family.members.map(name=>{
     const v = m.votes[name];
     const mine = name === state.me;
