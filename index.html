@@ -2661,7 +2661,9 @@ function renderSettingsModal(){
       <button class="btn btn-ghost btn-block" style="margin-top:10px;border-color:var(--gold-dim)" onclick="__cleanupTrainingLowScores()">🧠 Mover minhas notas &lt; 7 para “só algoritmo”</button>
       <p class="hint">Some do catálogo os títulos em que <b>você</b> deu nota 1–6. A nota continua alimentando o algoritmo. Não apaga nada.</p>
       <button class="btn btn-danger btn-block" style="margin-top:10px" onclick="__cleanupDeleteTrainingOnly()">🗑 Apagar de vez todos os “só algoritmo”</button>
-      <p class="hint">Remove do Firebase os ~593 (ou quantos houver) marcados como só algoritmo, com as notas. O algoritmo deixa de usá-los. Não tem volta.</p>
+      <p class="hint">Remove do Firebase os marcados como só algoritmo, com as notas. O algoritmo deixa de usá-los. Não tem volta.</p>
+      <button class="btn btn-danger btn-block" style="margin-top:10px" onclick="__cleanupDeleteMyLowScores()">🗑 Apagar de vez minhas notas 1–7</button>
+      <p class="hint">Remove do Firebase (e do algoritmo) tudo em que <b>você</b> deu nota abaixo de 8. Ficam só os que você marcou 8, 9 ou 10 — e os sem a sua nota. Não tem volta.</p>
       <div id="cleanup-msg"></div>
 
       <p class="hint" style="margin-top:10px">Atualiza notas (RT/Metacritic), país/idioma e — com TMDB — estreias, streaming e temporadas. ⏳ Catálogo grande pode demorar; deixe a tela aberta.</p>
@@ -2732,7 +2734,7 @@ function renderSettingsModal(){
   function refreshCleanupStats(){
     const el = document.getElementById('cleanup-stats');
     if(!el) return;
-    let hideN = 0, orphanN = 0, hiddenAlready = 0, trainingN = 0, lowScoreN = 0;
+    let hideN = 0, orphanN = 0, hiddenAlready = 0, trainingN = 0, lowScoreN = 0, below8N = 0, high8N = 0;
     state.movies.forEach(m=>{
       if(m.trainingOnly) trainingN++;
       if(isHiddenForMe(m)) hiddenAlready++;
@@ -2740,10 +2742,13 @@ function renderSettingsModal(){
       if(isOrphanMovie(m)) orphanN++;
       const v = m.votes && m.votes[state.me];
       if(!m.trainingOnly && v && v.score!=null && v.score < 7) lowScoreN++;
+      if(v && v.score!=null && v.score < 8) below8N++;
+      if(v && v.score!=null && v.score >= 8) high8N++;
     });
     const visible = state.movies.length - trainingN;
     el.innerHTML = `Visíveis no catálogo: <b style="color:var(--cream)">${visible}</b> · Só algoritmo: <b style="color:var(--gold)">${trainingN}</b> · Ocultos pra você: <b style="color:var(--cream)">${hiddenAlready}</b><br>
-      Podem ocultar: <b style="color:var(--gold)">${hideN}</b> · Podem apagar: <b style="color:var(--dislike)">${orphanN}</b> · Suas notas &lt; 7 ainda no catálogo: <b style="color:var(--gold)">${lowScoreN}</b>`;
+      Podem ocultar: <b style="color:var(--gold)">${hideN}</b> · Podem apagar: <b style="color:var(--dislike)">${orphanN}</b> · Suas notas &lt; 7 no catálogo: <b style="color:var(--gold)">${lowScoreN}</b><br>
+      Suas notas 1–7 (apagar): <b style="color:var(--dislike)">${below8N}</b> · Suas notas 8–10 (ficam): <b style="color:var(--like)">${high8N}</b>`;
   }
   setTimeout(refreshCleanupStats, 0);
 
@@ -2825,6 +2830,45 @@ function renderSettingsModal(){
     try{ saveMoviesCache(state.movies); }catch(e){}
     try{ initRecWorkerData(); }catch(e){}
     msg.innerHTML = `<div class="msg-ok">Removidos (só algoritmo): ${ok}${fail?` · falhas: ${fail}`:''}. Restam no Firebase: ${state.movies.length}.</div>`;
+    refreshCleanupStats();
+  };
+
+  window.__cleanupDeleteMyLowScores = async ()=>{
+    const targets = state.movies.filter(m=>{
+      const v = m.votes && m.votes[state.me];
+      return v && v.score != null && v.score < 8;
+    });
+    if(!targets.length){
+      document.getElementById('cleanup-msg').innerHTML = `<div class="msg-ok">Você não tem títulos com nota 1–7 para apagar.</div>`;
+      return;
+    }
+    const keepHigh = state.movies.filter(m=>{
+      const v = m.votes && m.votes[state.me];
+      return v && v.score != null && v.score >= 8;
+    }).length;
+    if(!confirm(`APAGAR DE VEZ ${targets.length} título(s) em que você deu nota 1–7?\n\nFicam no catálogo os ${keepHigh} com sua nota 8–10 e os que você ainda não avaliou.\n\nSomem do Firebase e do algoritmo. Não tem volta.`)) return;
+    if(!confirm(`Confirma de novo: excluir permanentemente ${targets.length} títulos (suas notas abaixo de 8)?`)) return;
+    const msg = document.getElementById('cleanup-msg');
+    msg.innerHTML = `<div class="hint">Apagando ${targets.length}… isso pode levar um minuto. Não feche a tela.</div>`;
+    const ids = new Set(targets.map(m=>m.id));
+    let ok = 0, fail = 0;
+    for(const m of targets){
+      try{
+        await fbDeleteMovie(m.id);
+        ok++;
+      }catch(e){
+        fail++;
+        console.error('cleanup delete low scores', m.id, e);
+      }
+      if((ok+fail) % 25 === 0){
+        msg.innerHTML = `<div class="hint">Apagando notas &lt; 8… ${ok+fail}/${targets.length}</div>`;
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }
+    state.movies = state.movies.filter(m => !ids.has(m.id));
+    try{ saveMoviesCache(state.movies); }catch(e){}
+    try{ initRecWorkerData(); }catch(e){}
+    msg.innerHTML = `<div class="msg-ok">Removidos (nota 1–7): ${ok}${fail?` · falhas: ${fail}`:''}. Restam no Firebase: ${state.movies.length}.</div>`;
     refreshCleanupStats();
   };
 
