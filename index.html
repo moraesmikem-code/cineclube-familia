@@ -1372,15 +1372,43 @@ function ratedCountFor(person){
   }
   return n;
 }
+
+// % gravada no aparelho: calcula UMA vez e reutiliza (não recalcula a cada abertura/nota)
+const REC_PCT_STORE_KEY = 'cineclube-rec-pct-v1';
+let _recPctPersistent = null;
+let _recPctSaveTimer = null;
+function loadRecPctPersistent(){
+  if(_recPctPersistent) return _recPctPersistent;
+  try{ _recPctPersistent = JSON.parse(localStorage.getItem(REC_PCT_STORE_KEY) || '{}') || {}; }
+  catch(e){ _recPctPersistent = {}; }
+  return _recPctPersistent;
+}
+function saveRecPctPersistentNow(){
+  try{ localStorage.setItem(REC_PCT_STORE_KEY, JSON.stringify(_recPctPersistent || {})); }catch(e){}
+}
+function scheduleSaveRecPctPersistent(){
+  if(_recPctSaveTimer) clearTimeout(_recPctSaveTimer);
+  _recPctSaveTimer = setTimeout(saveRecPctPersistentNow, 400);
+}
+function setPersistedPct(person, movieId, pct){
+  const all = loadRecPctPersistent();
+  if(!all[person]) all[person] = {};
+  all[person][movieId] = pct;
+  scheduleSaveRecPctPersistent();
+}
+
 function ensureRecCacheBucket(person){
-  // "v12" no key: worker + fórmula atual
-  const key = 'v12:' + person + ':' + ratedCountFor(person);
+  // Chave só por pessoa — NÃO depende do nº de notas (senão invalidava tudo a cada voto)
+  const key = 'v13-static:' + person;
   if(_recPctCache.key !== key){
-    _recPctCache = { key, map: new Map() };
+    const map = new Map();
+    const stored = (loadRecPctPersistent()[person]) || {};
+    Object.keys(stored).forEach(id => map.set(id, stored[id]));
+    _recPctCache = { key, map };
   }
   return _recPctCache.map;
 }
-// Já assistiu / avaliou → na ordenação por recomendação não precisa de %
+// Já assistiu / avaliou
 function isSeenBy(movie, person){
   if(!movie || !person) return false;
   const v = movie.votes && movie.votes[person];
@@ -1391,21 +1419,24 @@ function isSeenBy(movie, person){
 }
 function getAffinityPct(movie, person, opts){
   const map = ensureRecCacheBucket(person);
+  // Já tem % gravada → reutiliza (estática)
   if(map.has(movie.id)) return map.get(movie.id);
-  // Ordenação: não calcula % de já assistidos (vão para o fim com -1)
-  if(opts && opts.skipSeen && isSeenBy(movie, person)){
+  // Já viu e nunca calculou antes → não calcula agora (ordenação usa -1)
+  if(isSeenBy(movie, person)){
     map.set(movie.id, -1);
     return -1;
   }
+  // Primeira vez (não visto): calcula UMA vez e grava
   let pct = -1;
   try{
     const rec = estimateAffinity(movie, person);
     if(rec && rec.ready && rec.pct != null) pct = rec.pct;
   }catch(e){ pct = -1; }
   map.set(movie.id, pct);
+  setPersistedPct(person, movie.id, pct);
   return pct;
 }
-// Preenche o cache: só títulos NÃO assistidos (ordenação por recomendação)
+// Preenche só o que ainda NÃO tem % gravada (e não assistido)
 async function warmRecCache(list, person, onProgress){
   const map = ensureRecCacheBucket(person);
   const missing = [];
@@ -1420,21 +1451,28 @@ async function warmRecCache(list, person, onProgress){
     return;
   }
 
-  // Worker: calcula; na main marcamos vistos como -1
-  if(typeof Worker !== 'undefined'){
+  const missingIds = new Set(missing.map(m=>m.id));
+
+  // Worker: só aplicamos resultado nos que ainda faltavam (não sobrescreve % estática)
+  if(typeof Worker !== 'undefined' && missing.length > 30){
     try{
       ensureRecWorker();
       if(!_recWorkerReady) initRecWorkerData();
       const results = await computeAllViaWorker(person, onProgress);
       if(results && typeof results === 'object'){
         Object.keys(results).forEach(id=>{
+          if(!missingIds.has(id)) return;
+          if(map.has(id)) return;
           const m = state.movies.find(x => x.id === id);
-          if(m && isSeenBy(m, person)) map.set(id, -1);
-          else map.set(id, results[id]);
+          if(m && isSeenBy(m, person)){ map.set(id, -1); return; }
+          const pct = results[id];
+          map.set(id, pct);
+          setPersistedPct(person, id, pct);
         });
         for(let j=0;j<missing.length;j++){
           if(!map.has(missing[j].id)) map.set(missing[j].id, -1);
         }
+        saveRecPctPersistentNow();
         if(onProgress) onProgress(missing.length, missing.length);
         return;
       }
@@ -1443,7 +1481,7 @@ async function warmRecCache(list, person, onProgress){
     }
   }
 
-  // Fallback: fatias na main thread (só unwatched)
+  // Main thread: só missing
   const CHUNK = 80;
   for(let i=0;i<missing.length;i+=CHUNK){
     const end = Math.min(i+CHUNK, missing.length);
@@ -1451,6 +1489,7 @@ async function warmRecCache(list, person, onProgress){
     if(onProgress) onProgress(end, missing.length);
     await new Promise(r => setTimeout(r, 0));
   }
+  saveRecPctPersistentNow();
 }
 
 function sortMovieList(list, field, dir){
@@ -2553,10 +2592,15 @@ function renderMovieModal(id){
         m.checkins[state.me] = new Date().toISOString();
       }
     }
-    // Invalida caches de recomendação
+    // Perfil de gosto atualiza p/ NOVOS cálculos; % já gravadas dos outros títulos FICAM estáticas
+    try{ _profileCache = {}; }catch(e){}
     try{
-      _profileCache = {};
-      if(typeof _recPctCache !== 'undefined') _recPctCache = { key:null, map:{} };
+      const map = ensureRecCacheBucket(state.me);
+      // Mantém a % que já existia (previsão antes de avaliar). Só marca visto se não havia.
+      if(!map.has(m.id)){
+        map.set(m.id, -1);
+        setPersistedPct(state.me, m.id, -1);
+      }
     }catch(e){}
     try{ notifyWorkerMovieUpdated(m); }catch(e){}
     // Só modal + card — sem render() do catálogo
@@ -2664,6 +2708,8 @@ function renderSettingsModal(){
       <p class="hint">Remove do Firebase os marcados como só algoritmo, com as notas. O algoritmo deixa de usá-los. Não tem volta.</p>
       <button class="btn btn-danger btn-block" style="margin-top:10px" onclick="__cleanupDeleteMyLowScores()">🗑 Apagar de vez minhas notas 1–7</button>
       <p class="hint">Remove do Firebase (e do algoritmo) tudo em que <b>você</b> deu nota abaixo de 8. Ficam só os que você marcou 8, 9 ou 10 — e os sem a sua nota. Não tem volta.</p>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px;border-color:var(--gold-dim)" onclick="__recalcAllRecommendations()">🔄 Recalcular todas as recomendações</button>
+      <p class="hint">Apaga as % gravadas neste aparelho e calcula de novo (só títulos que você ainda não viu). Use daqui a meses, se o gosto ou o catálogo mudarem bastante. Depois as novas % voltam a ficar estáticas.</p>
       <div id="cleanup-msg"></div>
 
       <p class="hint" style="margin-top:10px">Atualiza notas (RT/Metacritic), país/idioma e — com TMDB — estreias, streaming e temporadas. ⏳ Catálogo grande pode demorar; deixe a tela aberta.</p>
@@ -2870,6 +2916,32 @@ function renderSettingsModal(){
     try{ initRecWorkerData(); }catch(e){}
     msg.innerHTML = `<div class="msg-ok">Removidos (nota 1–7): ${ok}${fail?` · falhas: ${fail}`:''}. Restam no Firebase: ${state.movies.length}.</div>`;
     refreshCleanupStats();
+  };
+
+  window.__recalcAllRecommendations = async ()=>{
+    if(!confirm('Recalcular todas as recomendações?\n\nAs % antigas deste aparelho serão apagadas. O app calcula de novo só os títulos que você ainda não viu, com o gosto atual, e grava as novas %.\n\nPode demorar com catálogo grande — deixe a tela aberta.')) return;
+    const msg = document.getElementById('cleanup-msg');
+    const person = state.me;
+    try{
+      // Limpa % persistidas desta pessoa
+      const all = loadRecPctPersistent();
+      all[person] = {};
+      _recPctPersistent = all;
+      saveRecPctPersistentNow();
+      _recPctCache = { key: '', map: new Map() };
+      try{ _profileCache = {}; }catch(e){}
+      msg.innerHTML = `<div class="hint">Recalculando…</div>`;
+      // Só não vistos do catálogo visível
+      const list = (state.movies || []).filter(m => !m.trainingOnly && !isSeenBy(m, person));
+      await warmRecCache(list, person, (done, total)=>{
+        if(msg) msg.innerHTML = `<div class="hint">Recalculando… ${done}/${total}</div>`;
+      });
+      saveRecPctPersistentNow();
+      const n = Object.keys((loadRecPctPersistent()[person]) || {}).length;
+      msg.innerHTML = `<div class="msg-ok">Pronto. ${n} recomendação(ões) nova(s) gravada(s). Daqui pra frente o app usa só essas até você recalcular de novo.</div>`;
+    }catch(e){
+      msg.innerHTML = `<div class="msg-error">Erro ao recalcular: ${escapeHtml(e.message||String(e))}</div>`;
+    }
   };
 
   window.__cleanupDeleteOrphans = async ()=>{
